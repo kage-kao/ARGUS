@@ -17,10 +17,5 @@ ARGUS - сервис, который сам записывает и сохран
 # Установка:
 
 ```bash
-curl -L -o setup.sh https://raw.githubusercontent.com/kage-kao/ARGUS/main/setup.sh
-```
-
-```bash
-chmod +x setup.sh
-./setup.sh
+curl -L https://raw.githubusercontent.com/kage-kao/ARGUS/main/setup.sh | bash
 ```
