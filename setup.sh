@@ -145,7 +145,7 @@ if systemctl is-active --quiet stream-recorder.service; then
     echo ""
     echo "Сервис работает. Откройте в браузере: http://$IP_ADDRESS:5000"
     echo ""
-    echo "‼️ ВАЖНО: Если что-то опять не так, смотрите логи командой:"
+    echo "‼️ ВАЖНО: Если что-то не так, смотрите логи командой:"
     echo "   journalctl -u stream-recorder -f"
 else
     echo "❌❌❌ ОШИБКА: Сервис не смог запуститься. Смотрите причину командой:"
