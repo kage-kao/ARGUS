@@ -1,340 +1,358 @@
 #!/bin/bash
+# ARGUS / stream-recorder — clean install for Debian 12 / 13.
+# Записывает стрим через yt-dlp -> заливает на Tempshare и Ranoz.
+# Веб-морда: Flask + gunicorn за nginx (порт 80).
 
-# Останавливаем выполнение скрипта при любой ошибке
-set -e
+set -euo pipefail
 
-# --- Проверка прав root ---
+# ---- root check ----
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Ошибка: Этот скрипт необходимо запускать с правами root." >&2
-  exit 1
+    echo "Запускать от root." >&2
+    exit 1
 fi
 
-echo "🔥 НАЧИНАЮ ПОЛНУЮ ПЕРЕУСТАНОВКУ С НУЛЯ."
-
-# --- ШАГ 1: ПОЛНАЯ ОЧИСТКА ОТ СТАРЫХ УСТАНОВОК ---
-echo "⚙️  (1/7) Остановка и полное удаление старого сервиса..."
-systemctl stop stream-recorder.service >/dev/null 2>&1 || true
-systemctl disable stream-recorder.service >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/stream-recorder.service
-systemctl daemon-reload
-
-echo "⚙️  (2/7) Удаление старой директории приложения..."
-rm -rf /opt/stream-recorder
-
-echo "⚙️  (3/7) Удаление старого системного пользователя..."
-userdel streamrecorder >/dev/null 2>&1 || true
-
-echo "✅ Система очищена. Начинаю чистую установку."
-
-# --- ШАГ 2: УСТАНОВКА ЗАВИСИМОСТЕЙ ---
-echo "⚙️  (4/7) Подключение репозитория backports и установка пакетов..."
-echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list
-apt-get update
-# Базовые пакеты из основного репозитория.
-# python3-gunicorn даёт Python-модуль, бинарник /usr/bin/gunicorn идёт отдельным пакетом — ставим оба.
-apt-get install -y python3-flask python3-gunicorn gunicorn ffmpeg curl
-# yt-dlp ставим из backports — там свежая версия.
-apt-get install -y -t bookworm-backports yt-dlp
-
-echo "✅ Пакеты установлены."
-
-# --- ШАГ 3: СОЗДАНИЕ СТРУКТУРЫ И ФАЙЛОВ ---
-echo "⚙️  (5/7) Создание пользователя, директорий и файлов приложения..."
-# Создаем пользователя
-useradd -r -m -d /opt/stream-recorder -s /bin/false streamrecorder
-
-# Создаем директории уже внутри домашней папки нового пользователя
 APP_DIR="/opt/stream-recorder"
-mkdir -p $APP_DIR/templates
-mkdir -p $APP_DIR/records
+APP_USER="streamrecorder"
+SERVICE="stream-recorder.service"
+PORT_APP=5000
+PORT_HTTP=80
 
-# Создаем скрипт записи.
-# Запись -> нарезка на валидные mp4-сегменты <=199МБ (ffmpeg copy, без реэнкода)
-# -> сжатие каждого сегмента через ezgif (внешний энкодер, не грузит ваш сервер)
-# -> склейка (ffmpeg copy) -> загрузка на Ranoz (<=4.99ГБ, .dat) + Tempshare (<=2ГБ).
-cat <<'EOF' > $APP_DIR/record_and_upload.sh
+log()  { printf '\033[1;36m[*]\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31m[ERR]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# =====================================================================
+log "1/8 Останавливаю и сношу старую установку"
+systemctl stop "$SERVICE"   2>/dev/null || true
+systemctl disable "$SERVICE" 2>/dev/null || true
+rm -f "/etc/systemd/system/$SERVICE"
+systemctl daemon-reload
+rm -rf "$APP_DIR"
+userdel "$APP_USER" 2>/dev/null || true
+
+# =====================================================================
+log "2/8 Подключаю backports и ставлю пакеты"
+echo "deb http://deb.debian.org/debian bookworm-backports main" \
+    > /etc/apt/sources.list.d/backports.list
+apt-get update -q
+
+# базовые
+apt-get install -y -q \
+    python3-flask python3-gunicorn gunicorn \
+    ffmpeg curl ca-certificates nginx iproute2
+
+# yt-dlp обязательно из backports — там свежий
+apt-get install -y -q -t bookworm-backports yt-dlp
+
+ok "Пакеты установлены"
+
+# =====================================================================
+log "3/8 Создаю пользователя и каталоги"
+useradd -r -m -d "$APP_DIR" -s /usr/sbin/nologin "$APP_USER"
+mkdir -p "$APP_DIR/templates" "$APP_DIR/records"
+
+# =====================================================================
+log "4/8 Пишу record_and_upload.sh (запись + аплоад)"
+cat > "$APP_DIR/record_and_upload.sh" <<'WORKER_EOF'
 #!/bin/bash
-# ARGUS record + compress + upload pipeline
+# Пишет стрим через yt-dlp, заливает на Tempshare и Ranoz, пишет ссылки в links.log.
 set -uo pipefail
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+export PATH="/usr/local/bin:/usr/bin:/bin"
 
-STREAM_URL="$1"
-APP_DIR="${ARGUS_DIR:-/opt/stream-recorder}"
-RECORDS_DIR="$APP_DIR/records"
-TS="$(date +%Y-%m-%d_%H-%M-%S)"
-WORK="$RECORDS_DIR/work_$$_$TS"
-LOGFILE="$RECORDS_DIR/links.log"
-RAW="$WORK/raw.mp4"
+STREAM_URL="${1:?usage: record_and_upload.sh <url>}"
+APP_DIR="/opt/stream-recorder"
+RECORDS="$APP_DIR/records"
+TS="$(date +%F_%H-%M-%S)"
+WORK="$RECORDS/work_$$_$TS"
+LOG="$RECORDS/links.log"
+RAW="$WORK/recording_$TS.mp4"
 
-# --- tunables ---
-EZGIF_MAX=175000000        # ~175MB, safe under ezgif 200MB upload cap
-TS_MAX=2000000000          # Tempshare ~2GB
-RZ_MAX=4990000000          # Ranoz ~4.99GB
-EZGIF_RES="640x360"        # aggressive compression target
-EZGIF_BITRATE="300"        # kbps
-EZGIF_FORMAT="mp4"
-EZGIF_BASE="https://ezgif.com/video-compressor"
-
-log(){ echo "INFO: $*"; }
-err(){ echo "ERROR: $*" >&2; }
+TEMPSHARE_MAX=2000000000   # ~2 GB
+RANOZ_MAX=4990000000       # ~4.99 GB
 
 mkdir -p "$WORK"
 
-# --- record ---
-if [ -n "${ARGUS_RAW_FILE:-}" ]; then
-  RAW="$ARGUS_RAW_FILE"
-  log "Using existing recording: $RAW"
-else
-  log "Recording: $STREAM_URL"
-  if ! yt-dlp --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36' --no-warnings -o "$RAW" "$STREAM_URL" 2>"$WORK/ytdlp.log"; then
-    err "yt-dlp failed. See $WORK/ytdlp.log"
+inf(){ echo "[$(date +%T)] $*"; }
+errf(){ echo "[$(date +%T)] ERROR: $*" >&2; }
+
+# ---------- запись ----------
+inf "Recording: $STREAM_URL"
+if ! yt-dlp --no-warnings --no-part \
+        --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' \
+        -o "$RAW" "$STREAM_URL" 2>"$WORK/ytdlp.log"; then
+    errf "yt-dlp failed: $(tail -n3 "$WORK/ytdlp.log" | tr '\n' ' ')"
+    rm -rf "$WORK"
     exit 1
-  fi
-  [ -f "$RAW" ] || { err "yt-dlp produced no file"; exit 1; }
-  log "Recorded: $RAW ($(stat -c%s "$RAW") bytes)"
 fi
+[ -s "$RAW" ] || { errf "no output file"; rm -rf "$WORK"; exit 1; }
+SIZE=$(stat -c%s "$RAW")
+inf "Saved: $RAW ($SIZE bytes)"
 
-# --- split into valid mp4 segments (copy, no re-encode) ---
-split_segments(){
-  local in="$1" target="$2" prefix="$3"
-  local dur bitrate segtime
-  dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$in")
-  bitrate=$(awk -v s="$(stat -c%s "$in")" -v d="$dur" 'BEGIN{print s/d}')
-  segtime=$(awk -v b="$bitrate" -v t="$target" 'BEGIN{v=int(t/b); if(v<1)v=1; print v}')
-  log "Split: dur=${dur}s bitrate=${bitrate}B/s segtime=${segtime}s target=${target}B"
-  ffmpeg -nostdin -hide_banner -loglevel error -i "$in" -c copy -f segment \
-    -segment_time "$segtime" -reset_timestamps 1 "$prefix" 2>/dev/null
+# ---------- разбиение ffmpeg copy на сегменты <=max ----------
+split_to() {
+    local in="$1" max="$2" prefix="$3"
+    local dur br segs
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$in" 2>/dev/null || echo 0)
+    [ "$(echo "$dur > 0" | bc -l 2>/dev/null || echo 0)" = "1" ] || { errf "bad duration"; return 1; }
+    br=$(awk -v s="$(stat -c%s "$in")" -v d="$dur" 'BEGIN{print s/d}')
+    segs=$(awk -v b="$br" -v t="$max" 'BEGIN{v=int(t/b); if(v<60)v=60; print v}')
+    inf "split: dur=${dur}s segtime=${segs}s -> $prefix"
+    ffmpeg -nostdin -hide_banner -loglevel error -i "$in" \
+        -c copy -f segment -segment_time "$segs" -reset_timestamps 1 "$prefix" 2>/dev/null
 }
 
-# --- compress one segment via ezgif -> stdout: compressed file path ---
-ezgif_compress(){
-  local seg="$1" out="$2"
-  local name size id ext eff compid compext attempt body
-  name="$(basename "$seg")"; size=$(stat -c%s "$seg")
-  [ "$size" -gt 200000000 ] && { err "$name >200MB, ezgif cap exceeded"; return 1; }
-
-  for attempt in 1 2 3; do
-    eff=$(curl -sSL -H "Referer: $EZGIF_BASE" \
-      -F "new-image=@$seg" -F "upload=Upload video!" \
-      -w "\n%{url_effective}" -o /dev/null "$EZGIF_BASE" 2>/dev/null | tail -1)
-    id=$(echo "$eff" | grep -oE 'ezgif-[a-f0-9]+\.[a-z0-9]+' | head -1)
-    ext="${id##*.}"; id="${id%.*}"; id="${id#ezgif-}"
-    [ -n "$id" ] && break
-    sleep 4
-  done
-  [ -z "$id" ] && { err "ezgif upload failed for $name"; return 1; }
-  log "ezgif uploaded $name -> $id.$ext"
-  sleep 4
-
-  for attempt in 1 2 3; do
-    body=$(curl -sSL -H "Referer: $EZGIF_BASE/ezgif-$id.$ext.html" \
-      -F "file=ezgif-$id.$ext" -F "resolution=$EZGIF_RES" -F "bitrate=$EZGIF_BITRATE" \
-      -F "format=$EZGIF_FORMAT" -F "video-compressor=Recompress video!" \
-      "$EZGIF_BASE/ezgif-$id.$ext" 2>/dev/null)
-    compid=$(echo "$body" | grep -oE 'ezgif-[a-f0-9]+\.[a-z0-9]+' | grep -v "^ezgif-$id\." | head -1)
-    [ -n "$compid" ] && break
-    sleep 6
-  done
-  [ -z "$compid" ] && { err "ezgif recompress failed for $name"; return 1; }
-  compext="${compid##*.}"; compid="${compid%.*}"; compid="${compid#ezgif-}"
-  log "ezgif compressed $name -> $compid.$compext"
-
-  curl -sSL -H "Referer: $EZGIF_BASE/ezgif-$id.$ext" \
-    -o "$out" "https://ezgif.com/save/ezgif-$compid.$compext" 2>/dev/null
-  if [ -s "$out" ] && ffprobe -v error "$out" >/dev/null 2>&1; then
-    log "downloaded compressed $name -> $(stat -c%s "$out") bytes"
-    return 0
-  fi
-  err "ezgif download failed for $name"
-  return 1
+# ---------- Tempshare ----------
+upload_tempshare() {
+    local f="$1"
+    curl -sS --max-time 600 -X POST \
+        -F "file=@$f" -F "duration=7" \
+        https://api.tempshare.su/upload 2>/dev/null \
+    | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("url",""))
+except: pass'
 }
 
-# --- Ranoz upload (video blocked -> use .dat) -> stdout: url ---
-upload_ranoz(){
-  local f="$1" size name j upurl furl
-  size=$(stat -c%s "$f"); name="$(basename "${f%.*}").dat"
-  j=$(curl -s -X POST https://ranoz.gg/api/v1/files/upload_url \
-      -H "Content-Type: application/json" \
-      -d "{\"filename\":\"$name\",\"size\":$size}")
-  upurl=$(echo "$j" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["upload_url"])' 2>/dev/null)
-  furl=$(echo "$j" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["url"])' 2>/dev/null)
-  [ -z "$upurl" ] && { err "Ranoz presigned failed"; return 1; }
-  curl -s -X PUT "$upurl" --upload-file "$f" -H "Content-Length: $size" -o /dev/null 2>/dev/null
-  echo "$furl"
+# ---------- Ranoz (presigned PUT, расширение .dat) ----------
+upload_ranoz() {
+    local f="$1" size name j upurl furl
+    size=$(stat -c%s "$f")
+    name="$(basename "${f%.*}").dat"
+    j=$(curl -sS --max-time 60 -X POST https://ranoz.gg/api/v1/files/upload_url \
+        -H "Content-Type: application/json" \
+        -d "{\"filename\":\"$name\",\"size\":$size}")
+    upurl=$(echo "$j" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin)["data"]["upload_url"])
+except: pass')
+    furl=$(echo "$j" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin)["data"]["url"])
+except: pass')
+    [ -z "$upurl" ] && { errf "ranoz: no presigned url"; return 1; }
+    curl -sS --max-time 1800 -X PUT "$upurl" \
+        --upload-file "$f" -H "Content-Length: $size" -o /dev/null
+    echo "$furl"
 }
 
-# --- Tempshare upload -> stdout: url ---
-upload_tempshare(){
-  local f="$1" url
-  url=$(curl -s -X POST -F "file=@$f" -F "duration=7" https://api.tempshare.su/upload \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin)["url"])' 2>/dev/null)
-  [ -z "$url" ] && { err "Tempshare failed"; return 1; }
-  echo "$url"
+upload_chunked() {
+    local f="$1" max="$2" tag="$3" upfn="$4"
+    local size pdir p u
+    size=$(stat -c%s "$f")
+    if [ "$size" -le "$max" ]; then
+        u=$($upfn "$f"); [ -n "$u" ] && echo "$u"
+        return
+    fi
+    pdir="$WORK/${tag}_parts"; mkdir -p "$pdir"
+    split_to "$f" "$max" "$pdir/${tag}_%03d.mp4" || return 1
+    for p in "$pdir"/${tag}_*.mp4; do
+        [ -e "$p" ] || continue
+        u=$($upfn "$p"); [ -n "$u" ] && echo "$u"
+    done
 }
 
-# --- split a file into <=maxbyte valid mp4 parts (copy) and upload each ---
-upload_split(){
-  local f="$1" max="$2" dest="$3" prefix="$4" upfn="$5"
-  local pdir="$WORK/$dest"; mkdir -p "$pdir"
-  split_segments "$f" "$max" "$pdir/$prefix"
-  local p outurl
-  for p in "$pdir"/${prefix}*; do
-    [ -e "$p" ] || continue
-    outurl=$($upfn "$p")
-    [ -n "$outurl" ] && echo "$outurl"
-  done
-}
+# ---------- запуск аплоадов ----------
+{
+    echo ""
+    echo "$(date '+%d.%m.%Y %H:%M:%S') | $(basename "$RAW") | $SIZE bytes"
+} >> "$LOG"
 
-# --- compress all raw segments ---
-mkdir -p "$WORK/seg" "$WORK/comp"
-split_segments "$RAW" "$EZGIF_MAX" "$WORK/seg/s_%03d.mp4"
-segs=("$WORK"/seg/s_*.mp4)
-log "Raw segments: ${#segs[@]}"
+inf "Uploading to Tempshare..."
+while read -r u; do
+    [ -n "$u" ] || continue
+    inf "tempshare: $u"
+    echo "  Tempshare: <a href='$u' target='_blank'>$u</a>" >> "$LOG"
+done < <(upload_chunked "$RAW" "$TEMPSHARE_MAX" "ts" upload_tempshare)
 
-COMBINED="$WORK/list.txt"; : > "$COMBINED"
-ok=0
-for s in "${segs[@]}"; do
-  [ -e "$s" ] || continue
-  c="$WORK/comp/$(basename "$s")"
-  if ezgif_compress "$s" "$c"; then
-    echo "file '$c'" >> "$COMBINED"; ok=$((ok+1))
-  else
-    err "using raw $s (ezgif failed)"
-    echo "file '$s'" >> "$COMBINED"; ok=$((ok+1))
-  fi
-done
-[ "$ok" -eq 0 ] && { err "no segments produced"; exit 1; }
+inf "Uploading to Ranoz..."
+while read -r u; do
+    [ -n "$u" ] || continue
+    inf "ranoz: $u"
+    echo "  Ranoz: <a href='$u' target='_blank'>$u</a>" >> "$LOG"
+done < <(upload_chunked "$RAW" "$RANOZ_MAX" "rz" upload_ranoz)
 
-# --- concat compressed segments (copy; fallback re-encode) ---
-FINAL="$WORK/final.mp4"
-if ! ffmpeg -nostdin -hide_banner -loglevel error -f concat -safe 0 -i "$COMBINED" -c copy "$FINAL" 2>/dev/null; then
-  log "concat copy failed, re-encoding"
-  ffmpeg -nostdin -hide_banner -loglevel error -f concat -safe 0 -i "$COMBINED" -c:v libx264 -c:a aac "$FINAL" 2>/dev/null
-fi
-[ -f "$FINAL" ] || { err "concat produced no file"; exit 1; }
-FSIZE=$(stat -c%s "$FINAL")
-log "Final: $FINAL ($FSIZE bytes) from $ok segments"
-
-# --- upload to both file hosters (split by their limits) ---
-echo "" >> "$LOGFILE"
-echo "$(date '+%d.%m.%Y %H:%M:%S') | $(basename "$FINAL")" >> "$LOGFILE"
-
-ranoz_urls=(); tempshare_urls=()
-if [ "$FSIZE" -le "$RZ_MAX" ]; then
-  u=$(upload_ranoz "$FINAL"); [ -n "$u" ] && ranoz_urls+=("$u")
-else
-  while read -r u; do [ -n "$u" ] && ranoz_urls+=("$u"); done < <(upload_split "$FINAL" "$RZ_MAX" "rz" "rz_%03d.mp4" upload_ranoz)
-fi
-if [ "$FSIZE" -le "$TS_MAX" ]; then
-  u=$(upload_tempshare "$FINAL"); [ -n "$u" ] && tempshare_urls+=("$u")
-else
-  while read -r u; do [ -n "$u" ] && tempshare_urls+=("$u"); done < <(upload_split "$FINAL" "$TS_MAX" "ts" "ts_%03d.mp4" upload_tempshare)
-fi
-
-for u in "${ranoz_urls[@]}"; do
-  echo "  Ranoz: <a href='$u' target='_blank'>$u</a>" >> "$LOGFILE"
-  log "Ranoz: $u"
-done
-for u in "${tempshare_urls[@]}"; do
-  echo "  Tempshare: <a href='$u' target='_blank'>$u</a>" >> "$LOGFILE"
-  log "Tempshare: $u"
-done
-
-# cleanup workdir (keep records dir)
+# чистим временное, но оставляем сам raw на сутки на всякий случай
 rm -rf "$WORK"
-log "Done."
-EOF
+inf "Done."
+WORKER_EOF
+chmod +x "$APP_DIR/record_and_upload.sh"
 
-# Создаем Flask-приложение
-cat <<'EOF' > $APP_DIR/app.py
+# =====================================================================
+log "5/8 Пишу Flask-приложение"
+cat > "$APP_DIR/app.py" <<'APP_EOF'
 from flask import Flask, request, render_template, redirect, url_for
-import subprocess, os, sys
+import subprocess, os, sys, shlex
+
+APP_DIR    = "/opt/stream-recorder"
+LOG_FILE   = os.path.join(APP_DIR, "records", "links.log")
+SCRIPT     = os.path.join(APP_DIR, "record_and_upload.sh")
+WORKER_LOG = os.path.join(APP_DIR, "records", "worker.log")
 
 app = Flask(__name__)
-APP_DIR = "/opt/stream-recorder"
-LOG_FILE = os.path.join(APP_DIR, "records", "links.log")
-SCRIPT_PATH = os.path.join(APP_DIR, "record_and_upload.sh")
 
-@app.route('/', methods=['GET', 'POST'])
+
+@app.route("/health")
+def health():
+    return "ok", 200
+
+
+@app.route("/", methods=["GET", "POST"])
 def index():
-    if request.method == 'POST':
-        stream_url = request.form.get('url')
-        if stream_url:
-            print(f"Received request to record URL: {stream_url}", file=sys.stderr)
-            command = f"nohup {SCRIPT_PATH} '{stream_url}' &"
-            subprocess.Popen(command, shell=True)
-            return redirect(url_for('index'))
-    recent_links = []
+    if request.method == "POST":
+        url = (request.form.get("url") or "").strip()
+        if url:
+            print(f"[web] new recording: {url}", file=sys.stderr, flush=True)
+            cmd = f"nohup {shlex.quote(SCRIPT)} {shlex.quote(url)} >> {shlex.quote(WORKER_LOG)} 2>&1 &"
+            subprocess.Popen(cmd, shell=True, executable="/bin/bash")
+        return redirect(url_for("index"))
+
+    links = []
     if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'r') as f:
-            recent_links = [line.strip() for line in f.readlines()]
-            recent_links.reverse()
-    return render_template('index.html', links=recent_links)
+        with open(LOG_FILE) as f:
+            links = [ln.rstrip() for ln in f if ln.strip()]
+        links.reverse()
+    return render_template("index.html", links=links)
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)  # only for local dev; production runs via gunicorn (see systemd unit)
-EOF
 
-# Создаем HTML-шаблон (без изменений)
-cat <<'EOF' > $APP_DIR/templates/index.html
-<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>Запись стримов</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;max-width:800px;margin:40px auto;padding:20px;background-color:#f8f9fa;color:#333}h1,h2{color:#0056b3}.container{background-color:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,.1)}form{display:flex;gap:10px;margin-bottom:30px}input[type=url]{flex-grow:1;padding:12px;border:1px solid #ccc;border-radius:4px;font-size:16px}input[type=submit]{padding:12px 20px;border:none;background-color:#28a745;color:#fff;border-radius:4px;font-size:16px;cursor:pointer;transition:background-color .2s}input[type=submit]:hover{background-color:#218838}.recent-links{list-style:none;padding:0}.recent-links li{background-color:#e9ecef;border:1px solid #dee2e6;padding:15px;margin-bottom:10px;border-radius:4px;word-wrap:break-word}.recent-links a{color:#0056b3;text-decoration:none}.recent-links a:hover{text-decoration:underline}</style></head><body><div class="container"><h1>Сервис записи стримов</h1><form action="/" method="post"><input type="url" name="url" placeholder="Вставьте ссылку на .flv или .m3u8 стрим" required><input type="submit" value="Начать запись"></form><h2>Недавние записи</h2>{% if links %}<ul class="recent-links">{% for link in links %}<li>{{ link|safe }}</li>{% endfor %}</ul>{% else %}<p>Здесь будут отображаться ссылки на скачивание записанных стримов.</p>{% endif %}</div></body></html>
-EOF
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+APP_EOF
 
-echo "✅ Файлы созданы."
+# =====================================================================
+log "6/8 Пишу шаблон"
+cat > "$APP_DIR/templates/index.html" <<'HTML_EOF'
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>ARGUS — запись стримов</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, Menlo, Consolas, monospace;
+         background:#0f1115; color:#d8dee9; max-width:880px;
+         margin:40px auto; padding:0 20px; }
+  h1 { color:#88c0d0; margin:0 0 24px; }
+  h2 { color:#a3be8c; margin-top:32px; }
+  form { display:flex; gap:8px; margin-bottom:24px; }
+  input[type=url] { flex:1; padding:12px; background:#1f2430;
+                    border:1px solid #2e3440; color:#eceff4;
+                    border-radius:6px; font:inherit; }
+  input[type=submit] { padding:12px 22px; border:0; cursor:pointer;
+                       background:#a3be8c; color:#0f1115;
+                       border-radius:6px; font-weight:bold; }
+  input[type=submit]:hover { background:#b9d39c; }
+  ul { list-style:none; padding:0; }
+  li { background:#1f2430; border:1px solid #2e3440;
+       padding:12px 14px; margin-bottom:8px; border-radius:6px;
+       word-break:break-all; }
+  a { color:#88c0d0; }
+  .empty { color:#6c7280; }
+</style>
+</head>
+<body>
+  <h1>ARGUS — запись стримов</h1>
+  <form method="post">
+    <input type="url" name="url" placeholder="https://... (.m3u8 / .flv / любой источник для yt-dlp)" required>
+    <input type="submit" value="Записать">
+  </form>
+  <h2>Последние записи</h2>
+  {% if links %}
+    <ul>{% for l in links %}<li>{{ l|safe }}</li>{% endfor %}</ul>
+  {% else %}
+    <p class="empty">Пока ничего не записано.</p>
+  {% endif %}
+</body>
+</html>
+HTML_EOF
 
-# --- ШАГ 4: НАСТРОЙКА ПРАВ И СЕРВИСА ---
-echo "⚙️  (6/7) Настройка прав доступа и создание systemd сервиса..."
-# Выставляем права. Теперь это домашняя директория пользователя, проблем быть не должно.
-chown -R streamrecorder:streamrecorder $APP_DIR
-chmod +x $APP_DIR/record_and_upload.sh
+# =====================================================================
+log "7/8 Права, systemd unit, nginx, файрвол"
+chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
-# Определяем путь к gunicorn (бинарник из пакета gunicorn, либо запуск через python3 -m gunicorn).
-if command -v gunicorn >/dev/null 2>&1; then
-    GUNICORN_CMD="$(command -v gunicorn)"
-else
-    # Фолбэк: запуск модуля через python3 — работает с установленным python3-gunicorn.
-    GUNICORN_CMD="/usr/bin/python3 -m gunicorn"
-fi
-echo "ℹ️  Используем gunicorn: $GUNICORN_CMD"
-
-# Создаем сервис
-cat <<EOF > /etc/systemd/system/stream-recorder.service
+# systemd unit. /usr/bin/gunicorn уже точно есть (пакет gunicorn установлен).
+cat > "/etc/systemd/system/$SERVICE" <<UNIT
 [Unit]
-Description=Stream Recorder Service
+Description=Stream Recorder (Flask + gunicorn)
 After=network.target
 
 [Service]
-User=streamrecorder
-Group=streamrecorder
+Type=simple
+User=$APP_USER
+Group=$APP_USER
 WorkingDirectory=$APP_DIR
-# Важно: запускаем через gunicorn (production WSGI, многопоточный) вместо dev-сервера Flask
-ExecStart=$GUNICORN_CMD --workers 2 --bind 0.0.0.0:5000 --chdir $APP_DIR app:app
+ExecStart=/usr/bin/gunicorn --workers 2 --bind 127.0.0.1:$PORT_APP app:app
 Restart=always
 RestartSec=3
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
-echo "✅ Права и сервис настроены."
+# nginx reverse proxy: 80 -> 127.0.0.1:5000
+cat > /etc/nginx/sites-available/stream-recorder <<NGINX
+server {
+    listen $PORT_HTTP default_server;
+    listen [::]:$PORT_HTTP default_server;
+    server_name _;
 
-# --- ШАГ 5: ЗАПУСК ---
-echo "⚙️  (7/7) Запуск и проверка сервиса..."
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:$PORT_APP;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 300s;
+    }
+}
+NGINX
+rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/stream-recorder
+ln -s /etc/nginx/sites-available/stream-recorder /etc/nginx/sites-enabled/stream-recorder
+nginx -t
+
+# Файрвол — открыть порты если ufw активен
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "$PORT_HTTP"/tcp     >/dev/null || true
+    ufw allow "$PORT_APP"/tcp      >/dev/null || true
+    ok "ufw: открыт $PORT_HTTP/tcp и $PORT_APP/tcp"
+fi
+
+# =====================================================================
+log "8/8 Запуск"
 systemctl daemon-reload
-systemctl enable stream-recorder.service
-systemctl start stream-recorder.service
-sleep 2 # Даем сервису время на запуск
+systemctl enable --now "$SERVICE"
+systemctl restart nginx
+sleep 2
 
-IP_ADDRESS=$(hostname -I | awk '{print $1}')
-echo ""
-if systemctl is-active --quiet stream-recorder.service; then
-    echo "🎉🎉🎉 ВСЁ! УСТАНОВКА ЗАВЕРШЕНА! 🎉🎉🎉"
-    echo ""
-    echo "Сервис работает. Откройте в браузере: http://$IP_ADDRESS:5000"
-    echo ""
-    echo "‼️ ВАЖНО: Если что-то не так, смотрите логи командой:"
-    echo "   journalctl -u stream-recorder -f"
-else
-    echo "❌❌❌ ОШИБКА: Сервис не смог запуститься. Смотрите причину командой:"
-    echo "   journalctl -u stream-recorder --no-pager"
+if ! systemctl is-active --quiet "$SERVICE"; then
+    warn "stream-recorder не запустился. Логи:"
+    journalctl -u "$SERVICE" --no-pager -n 30
+    die  "не удалось поднять сервис"
+fi
+
+# health-check
+if ! curl -fsS --max-time 5 "http://127.0.0.1:$PORT_APP/health" >/dev/null; then
+    warn "gunicorn не отвечает на /health (внутренний 127.0.0.1:$PORT_APP)"
+fi
+if ! curl -fsS --max-time 5 "http://127.0.0.1:$PORT_HTTP/health" >/dev/null; then
+    warn "nginx не отвечает на :$PORT_HTTP/health"
+fi
+
+# IP-адреса
+PRIVATE_IP=$(hostname -I | awk '{print $1}')
+PUBLIC_IP=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+            || curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
+            || echo "")
+
+echo
+ok "Установка завершена."
+echo
+echo "  Внутренний IP : http://$PRIVATE_IP/    (или :$PORT_APP)"
+[ -n "$PUBLIC_IP" ] && echo "  Внешний  IP   : http://$PUBLIC_IP/     (или :$PORT_APP)"
+echo
+echo "  Логи сервиса : journalctl -u $SERVICE -f"
+echo "  Логи воркера : tail -f $APP_DIR/records/worker.log"
+echo
+if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "$PRIVATE_IP" ]; then
+    warn "Заходи в браузере по ВНЕШНЕМУ IP ($PUBLIC_IP), а не по $PRIVATE_IP — он приватный."
 fi
