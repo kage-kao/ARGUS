@@ -1,6 +1,0 @@
-aiogram==3.13.1
-aiohttp==3.10.10
-aiofiles==24.1.0
-python-dotenv==1.0.1
-beautifulsoup4==4.12.3
-yt-dlp>=2024.10.7
