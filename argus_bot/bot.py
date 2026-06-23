@@ -1,0 +1,417 @@
+"""Telegram bot — main entrypoint."""
+from __future__ import annotations
+import asyncio
+import logging
+import re
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Dict
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
+
+from . import config, pipeline, storage, ffwrap
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("argus.bot")
+
+URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# In-memory state
+# ---------------------------------------------------------------------------
+@dataclass
+class Pending:
+    """Per-user wizard state while choosing options for the next job."""
+    url: str
+    hosters: list[str] | None = None
+    quality: str | None = None
+    ts_duration: int | None = None
+    msg_id: int | None = None    # message we keep editing
+    chat_id: int | None = None
+    created: float = field(default_factory=time.time)
+
+
+@dataclass
+class ActiveJob:
+    task: asyncio.Task
+    registry: ffwrap.ProcRegistry
+
+
+_pending: Dict[int, Pending] = {}            # user_id -> Pending
+_active: Dict[str, ActiveJob] = {}           # job_id -> ActiveJob
+
+
+# ---------------------------------------------------------------------------
+# Texts
+# ---------------------------------------------------------------------------
+WELCOME = (
+    "👁️ <b>ARGUS</b> — запись стримов без лишних хлопот.\n\n"
+    "Пришли ссылку (m3u8 / flv / любой URL для yt-dlp). "
+    "Бот доведёт запись до финала, обработает через ezgif "
+    "и отправит на файлообменник.\n\n"
+    "<b>Доступные команды:</b>\n"
+    "/start — начало диалога\n"
+    "/status — активные задачи\n"
+    "/cancel &lt;job_id&gt; — отменить активную задачу"
+)
+
+
+# ---------------------------------------------------------------------------
+# Keyboards
+# ---------------------------------------------------------------------------
+def _kb_hoster() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📦 Ranoz (4.99 GB)", callback_data="h:ranoz"),
+            InlineKeyboardButton(text="⏳ Tempshare (2 GB)", callback_data="h:tempshare"),
+        ],
+        [InlineKeyboardButton(text="🚀 Оба сразу", callback_data="h:both")],
+        [InlineKeyboardButton(text="✖️ Отмена", callback_data="h:cancel")],
+    ])
+
+
+def _kb_quality() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"q:{key}")]
+        for key, (_, _, label) in config.QUALITY_PRESETS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="✖️ Отмена", callback_data="q:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _kb_ts_duration() -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton(text=f"{d} {'день' if d == 1 else 'дня' if d == 3 else 'дней'}",
+                             callback_data=f"d:{d}")
+        for d in config.TEMPSHARE_DURATIONS
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        row,
+        [InlineKeyboardButton(text="✖️ Отмена", callback_data="d:cancel")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+async def cmd_start(m: Message) -> None:
+    await m.answer(WELCOME)
+
+
+async def cmd_status(m: Message) -> None:
+    rows = storage.list_user_active(m.from_user.id)
+    if not rows:
+        await m.answer("Активных задач нет.")
+        return
+    lines = [f"<b>Активных задач: {len(rows)}</b>", ""]
+    for j in rows:
+        age = int(time.time() - j.created_at)
+        lines.append(
+            f"• <code>{j.id}</code>  <i>{j.status}</i> · {j.progress or '—'}  "
+            f"({age}s)\n  {j.url[:80]}"
+        )
+    lines.append("")
+    lines.append("Отменить:  /cancel &lt;job_id&gt;")
+    await m.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_cancel(m: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip()
+    if not arg:
+        await m.answer("Укажи id задачи: <code>/cancel &lt;job_id&gt;</code>\n"
+                       "Список активных — /status")
+        return
+    job = storage.get(arg)
+    if not job or job.user_id != m.from_user.id:
+        await m.answer("Задача не найдена.")
+        return
+    if job.status not in storage.ACTIVE_STATUSES:
+        await m.answer(f"Задача уже в статусе <i>{job.status}</i>.")
+        return
+
+    aj = _active.get(arg)
+    if aj is None:
+        # process-restart edge case: not in memory, just mark cancelled in DB
+        storage.update(arg, status="cancelled", error="cancelled (no live task)")
+        await m.answer(f"🛑 Задача <code>{arg}</code> помечена отменённой.")
+        return
+
+    aj.registry.kill_all()
+    aj.task.cancel()
+    await m.answer(f"🛑 Задача <code>{arg}</code> отменяется…")
+
+
+async def on_url(m: Message) -> None:
+    text = (m.text or "").strip()
+    if not URL_RE.match(text):
+        await m.answer("Это не похоже на ссылку. Пришли URL стрима, начинающийся с http(s)://")
+        return
+    user_id = m.from_user.id
+    _pending[user_id] = Pending(url=text)
+    sent = await m.answer(
+        f"🎯 Ссылка принята:\n<code>{text}</code>\n\n"
+        f"Куда заливать готовую запись?",
+        reply_markup=_kb_hoster(),
+        disable_web_page_preview=True,
+    )
+    _pending[user_id].msg_id = sent.message_id
+    _pending[user_id].chat_id = sent.chat.id
+
+
+async def on_hoster(cq: CallbackQuery) -> None:
+    user_id = cq.from_user.id
+    choice = (cq.data or "").split(":", 1)[1]
+    pj = _pending.get(user_id)
+    if not pj:
+        await cq.answer("Сессия истекла, пришли ссылку заново.", show_alert=True)
+        return
+    if choice == "cancel":
+        _pending.pop(user_id, None)
+        await cq.message.edit_text("✖️ Отменено.")
+        await cq.answer()
+        return
+    pj.hosters = {"ranoz": ["ranoz"], "tempshare": ["tempshare"],
+                  "both": ["ranoz", "tempshare"]}[choice]
+
+    label_map = {"ranoz": "Ranoz", "tempshare": "Tempshare"}
+    h_text = " + ".join(label_map[h] for h in pj.hosters)
+    await cq.message.edit_text(
+        f"🎯 <code>{pj.url}</code>\n"
+        f"📤 Хостер: <b>{h_text}</b>\n\n"
+        f"Выбери качество сжатия:",
+        reply_markup=_kb_quality(),
+        disable_web_page_preview=True,
+    )
+    await cq.answer()
+
+
+async def on_quality(cq: CallbackQuery) -> None:
+    user_id = cq.from_user.id
+    choice = (cq.data or "").split(":", 1)[1]
+    pj = _pending.get(user_id)
+    if not pj or not pj.hosters:
+        await cq.answer("Сессия истекла, пришли ссылку заново.", show_alert=True)
+        return
+    if choice == "cancel":
+        _pending.pop(user_id, None)
+        await cq.message.edit_text("✖️ Отменено.")
+        await cq.answer()
+        return
+    if choice not in config.QUALITY_PRESETS:
+        await cq.answer("Неизвестное качество.", show_alert=True)
+        return
+    pj.quality = choice
+
+    if "tempshare" in pj.hosters:
+        # ask for storage duration
+        await cq.message.edit_text(
+            f"🎯 <code>{pj.url}</code>\n"
+            f"📤 Хостер: {' + '.join(pj.hosters)}\n"
+            f"🗜 Качество: {config.QUALITY_PRESETS[choice][2]}\n\n"
+            f"Сколько дней хранить файл в Tempshare?",
+            reply_markup=_kb_ts_duration(),
+            disable_web_page_preview=True,
+        )
+        await cq.answer()
+        return
+
+    # tempshare not selected → start immediately
+    pj.ts_duration = config.DEFAULT_TS_DURATION
+    await _start_job(cq.bot, cq, pj)
+
+
+async def on_duration(cq: CallbackQuery) -> None:
+    user_id = cq.from_user.id
+    choice = (cq.data or "").split(":", 1)[1]
+    pj = _pending.get(user_id)
+    if not pj or not pj.hosters or not pj.quality:
+        await cq.answer("Сессия истекла, пришли ссылку заново.", show_alert=True)
+        return
+    if choice == "cancel":
+        _pending.pop(user_id, None)
+        await cq.message.edit_text("✖️ Отменено.")
+        await cq.answer()
+        return
+    try:
+        days = int(choice)
+    except ValueError:
+        await cq.answer("Некорректное значение.", show_alert=True)
+        return
+    if days not in config.TEMPSHARE_DURATIONS:
+        await cq.answer("Некорректный срок.", show_alert=True)
+        return
+    pj.ts_duration = days
+    await _start_job(cq.bot, cq, pj)
+
+
+async def _start_job(bot: Bot, cq: CallbackQuery, pj: Pending) -> None:
+    job_id = uuid.uuid4().hex[:10]
+    user_id = cq.from_user.id
+    label_map = {"ranoz": "Ranoz", "tempshare": "Tempshare"}
+    h_text = " + ".join(label_map[h] for h in (pj.hosters or []))
+    q_label = config.QUALITY_PRESETS[pj.quality][2]  # type: ignore
+
+    # persist
+    storage.insert(storage.Job(
+        id=job_id,
+        user_id=user_id,
+        chat_id=cq.message.chat.id,
+        url=pj.url,
+        hosters=pj.hosters or [],
+        quality=pj.quality or config.DEFAULT_QUALITY,
+        ts_duration=pj.ts_duration or 0,
+        status="pending",
+    ))
+
+    summary_lines = [
+        f"⏳ Запускаю запись.  ID: <code>{job_id}</code>",
+        f"🎯 URL: <code>{pj.url}</code>",
+        f"📤 Хостер: <b>{h_text}</b>",
+        f"🗜 Качество: <b>{q_label}</b>",
+    ]
+    if "tempshare" in (pj.hosters or []):
+        summary_lines.append(f"⏳ Tempshare: <b>{pj.ts_duration} дн.</b>")
+    summary_lines.append("")
+    summary_lines.append("Я буду присылать прогресс. "
+                        "Запись идёт до конца стрима — это могут быть часы.")
+    summary_lines.append(f"\nОтменить: <code>/cancel {job_id}</code>")
+
+    await cq.message.edit_text("\n".join(summary_lines),
+                               disable_web_page_preview=True)
+    await cq.answer("Поехали!")
+    _pending.pop(user_id, None)
+
+    registry = ffwrap.ProcRegistry()
+    task = asyncio.create_task(_run_job(bot, job_id, pj, registry))
+    _active[job_id] = ActiveJob(task=task, registry=registry)
+
+
+async def _run_job(bot: Bot, job_id: str, pj: Pending,
+                   registry: ffwrap.ProcRegistry) -> None:
+    chat_id = pj.chat_id  # type: ignore
+    last_msg = {"id": None, "text": ""}
+
+    async def progress(msg: str):
+        if last_msg["id"] is None:
+            sent = await bot.send_message(chat_id, msg)
+            last_msg["id"] = sent.message_id
+            last_msg["text"] = msg
+        else:
+            if msg != last_msg["text"]:
+                try:
+                    await bot.edit_message_text(msg, chat_id=chat_id,
+                                                message_id=last_msg["id"])
+                    last_msg["text"] = msg
+                except Exception:
+                    sent = await bot.send_message(chat_id, msg)
+                    last_msg["id"] = sent.message_id
+                    last_msg["text"] = msg
+
+    try:
+        result = await pipeline.run_pipeline(
+            job_id=job_id,
+            stream_url=pj.url,
+            hosters=pj.hosters or [],
+            quality=pj.quality or config.DEFAULT_QUALITY,
+            ts_duration=pj.ts_duration or config.DEFAULT_TS_DURATION,
+            registry=registry,
+            progress=progress,
+        )
+    except asyncio.CancelledError:
+        registry.kill_all()
+        storage.update(job_id, status="cancelled", error="cancelled by user")
+        await bot.send_message(chat_id,
+            f"🛑 Задача <code>{job_id}</code> отменена.")
+        return
+    except Exception as e:
+        log.exception("pipeline crashed")
+        storage.update(job_id, status="failed", error=str(e))
+        await bot.send_message(chat_id, f"❌ Внутренняя ошибка: {e}")
+        return
+    finally:
+        _active.pop(job_id, None)
+
+    if result.cancelled:
+        await bot.send_message(chat_id,
+            f"🛑 Задача <code>{job_id}</code> отменена.")
+        return
+    if not result.ok:
+        await bot.send_message(chat_id,
+            f"❌ <code>{job_id}</code> не завершилась.\n"
+            f"Ошибка: <code>{result.error}</code>")
+        return
+
+    lines = [
+        f"🎉 <b>Готово!</b>  <code>{job_id}</code>",
+        f"⏱ Заняло: {int(result.elapsed)}s",
+        f"📥 Запись: {_h(result.raw_size)} ({int(result.duration_sec)}s)",
+        f"📤 После сжатия: {_h(result.final_size)}",
+        "",
+    ]
+    for label, urls in result.links.items():
+        lines.append(f"<b>{label}</b> ({len(urls)} файл(ов)):")
+        for u in urls:
+            lines.append(f"• {u}")
+        lines.append("")
+    await bot.send_message(chat_id, "\n".join(lines),
+                           disable_web_page_preview=True)
+
+
+def _h(n: int) -> str:
+    f = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024:
+            return f"{f:.1f} {u}"
+        f /= 1024
+    return f"{f:.1f} PB"
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+async def main() -> None:
+    if not config.BOT_TOKEN:
+        print("ERROR: BOT_TOKEN is empty. Set it in /opt/argus-bot/.env",
+              file=sys.stderr)
+        sys.exit(1)
+
+    storage.init()
+    n = storage.mark_stale_interrupted()
+    if n:
+        log.warning("marked %d stale active job(s) as 'interrupted'", n)
+
+    bot = Bot(config.BOT_TOKEN,
+              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+
+    dp.message.register(cmd_start, CommandStart())
+    dp.message.register(cmd_status, Command("status"))
+    dp.message.register(cmd_cancel, Command("cancel"))
+    dp.message.register(on_url, F.text)
+    dp.callback_query.register(on_hoster, F.data.startswith("h:"))
+    dp.callback_query.register(on_quality, F.data.startswith("q:"))
+    dp.callback_query.register(on_duration, F.data.startswith("d:"))
+
+    log.info("ARGUS bot starting…")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
