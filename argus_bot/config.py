@@ -10,6 +10,12 @@ if ENV_FILE.exists():
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
+# BuzzCast tourist tokens (to avoid rate limits)
+# Get your own: https://www.buzzcast.com -> DevTools console:
+# JSON.stringify({vid: localStorage.getItem('touristToken'), did: localStorage.getItem('_did')})
+BUZZCAST_VID = os.environ.get("VID", "2069498638797955072")
+BUZZCAST_DID = os.environ.get("DID", "378f9de3-0b0a-4e6d-8969-890939d9d5b6")
+
 WORK_DIR = APP_DIR / "work"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 

@@ -5,6 +5,8 @@ Uses the authoritative 3-step method:
 1. Tourist token via POST /api/user/pwa/event
 2. Check liveId via GET /api/token/live/info/getLiveByUserId  
 3. Get stream URLs via POST /faceshow/tokens/live/broadcast/detail
+
+Supports SOCKS5 proxy rotation to avoid rate limits.
 """
 from __future__ import annotations
 import aiohttp
@@ -15,6 +17,8 @@ import time
 import uuid
 from typing import Any
 
+from .proxy_manager import get_proxy_manager
+
 
 BASE_URL = "https://api.buzzcast.com"
 FACE_URL = "https://dhcxzil.buzzcast.com/faceshow"
@@ -22,11 +26,30 @@ UA = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120 Mobile Safar
 
 
 class BuzzCastClient:
-    """Anonymous tourist client for BuzzCast API."""
+    """Anonymous tourist client for BuzzCast API.
+    
+    To avoid rate limits, set environment variables:
+    - VID: tourist token ID (from localStorage.touristToken)
+    - DID: device ID (from localStorage._did)
+    
+    Get your own token: open https://www.buzzcast.com in browser, then in DevTools console:
+    JSON.stringify({
+      vid: localStorage.getItem("touristToken") || localStorage.getItem("touristUUID"),
+      did: localStorage.getItem("_did") || localStorage.getItem("did")
+    })
+    
+    Uses SOCKS5 proxy rotation to bypass rate limits.
+    """
     
     def __init__(self):
-        self.device_id = uuid.uuid4().hex
-        self.tourist_vid: int | None = None
+        import os
+        # Use pre-configured tokens if available (avoids rate limits)
+        self.device_id = os.environ.get("DID", "378f9de3-0b0a-4e6d-8969-890939d9d5b6")
+        vid_env = os.environ.get("VID", "2069498638797955072")
+        self.tourist_vid: int | None = int(vid_env) if vid_env else None
+        self.proxy_manager = get_proxy_manager()
+        self.current_proxy: str | None = None
+        print(f"[BuzzCast] Using device_id={self.device_id[:16]}..., vid={self.tourist_vid}")
     
     def _api_common(self) -> str:
         """Generate api_common header (base64 encoded JSON)."""
@@ -59,42 +82,83 @@ class BuzzCastClient:
         }
     
     async def init_tourist(self, session: aiohttp.ClientSession) -> int:
-        """Initialize tourist session and return tourist vid."""
+        """Initialize tourist session and return tourist vid.
+        
+        If VID is already set (from env), skip initialization to avoid rate limits.
+        Uses proxy rotation to bypass rate limits.
+        """
         import asyncio
+        
+        # If we already have a tourist_vid from env, use it
+        if self.tourist_vid is not None:
+            print(f"[BuzzCast] Using pre-configured tourist vid: {self.tourist_vid}")
+            return self.tourist_vid
+        
+        # Load proxies if not loaded
+        if not self.proxy_manager.proxies:
+            await self.proxy_manager.load_proxies(session)
         
         url = f"{BASE_URL}/api/user/pwa/event"
         payload = {"webId": f"pwa_{self.device_id}"}
         
-        # Retry with backoff on rate limit
-        max_retries = 3
+        # Retry with proxy rotation
+        max_retries = 10
         for attempt in range(max_retries):
+            # Get proxy
+            proxy = self.proxy_manager.get_random_proxy()
+            if proxy:
+                print(f"[BuzzCast] 🔄 Attempt {attempt+1}/{max_retries} with proxy: {proxy[:50]}...")
+            else:
+                print(f"[BuzzCast] ⚠️ No proxies available, trying without proxy...")
+            
             try:
-                async with session.post(url, headers=self._headers(), json=payload, timeout=20) as resp:
+                connector = aiohttp.TCPConnector() if not proxy else None
+                timeout = aiohttp.ClientTimeout(total=15)
+                
+                async with session.post(
+                    url,
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=timeout,
+                    proxy=proxy,
+                    connector=connector
+                ) as resp:
                     data = await resp.json()
                     
-                    # Handle rate limit
+                    # Handle rate limit - switch proxy
                     if data.get("code") == 429:
-                        if attempt < max_retries - 1:
-                            wait_time = 10 * (attempt + 1)
-                            print(f"[BuzzCast] Rate limited, waiting {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        else:
-                            raise RuntimeError(f"Tourist init failed after retries: {data}")
+                        if proxy:
+                            self.proxy_manager.mark_failed(proxy)
+                        print(f"[BuzzCast] ⚠️ Rate limited (429), switching proxy...")
+                        await asyncio.sleep(2)
+                        continue
                     
                     if data.get("code") != 1:
-                        raise RuntimeError(f"Tourist init failed: {data}")
+                        print(f"[BuzzCast] Error: {data}")
+                        if proxy:
+                            self.proxy_manager.mark_failed(proxy)
+                        await asyncio.sleep(2)
+                        continue
                     
+                    # Success!
                     self.tourist_vid = data["data"]["id"]
+                    if proxy:
+                        self.proxy_manager.mark_success(proxy)
+                        self.current_proxy = proxy
+                    print(f"[BuzzCast] ✅ New tourist session: vid={self.tourist_vid} (proxy: {'yes' if proxy else 'no'})")
                     return self.tourist_vid
-            except asyncio.TimeoutError:
-                if attempt < max_retries - 1:
-                    print(f"[BuzzCast] Timeout, retrying...")
-                    await asyncio.sleep(5)
-                    continue
-                raise
+                    
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                print(f"[BuzzCast] Connection error: {str(e)[:80]}")
+                if proxy:
+                    self.proxy_manager.mark_failed(proxy)
+                await asyncio.sleep(1)
+                continue
         
-        raise RuntimeError("Failed to initialize tourist session")
+        raise RuntimeError(
+            f"Tourist init failed after {max_retries} retries.\n"
+            f"SOLUTION: Set VID and DID environment variables in /opt/argus-bot/.env"
+        )
     
     async def is_live_and_liveid(self, session: aiohttp.ClientSession, user_id: str | int) -> int:
         """Step 2: Check if user is live and get liveId.
@@ -108,14 +172,36 @@ class BuzzCastClient:
         url = f"{BASE_URL}/api/token/live/info/getLiveByUserId"
         params = {"userId": str(user_id)}
         
-        async with session.get(url, params=params, headers=self._headers(), timeout=20) as resp:
-            data = await resp.json()
-            if data.get("code") != 1:
-                print(f"[BuzzCast] getLiveByUserId error: {data}")
+        # Try with proxy
+        proxy = self.current_proxy or self.proxy_manager.get_random_proxy()
+        
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers=self._headers(),
+                timeout=20,
+                proxy=proxy
+            ) as resp:
+                data = await resp.json()
+                if data.get("code") != 1:
+                    print(f"[BuzzCast] getLiveByUserId error: {data}")
+                    return 0
+                
+                live_data = data.get("data")
+                return int(live_data) if live_data else 0
+        except Exception as e:
+            print(f"[BuzzCast] getLiveByUserId exception: {e}")
+            # Try without proxy
+            try:
+                async with session.get(url, params=params, headers=self._headers(), timeout=20) as resp:
+                    data = await resp.json()
+                    if data.get("code") != 1:
+                        return 0
+                    live_data = data.get("data")
+                    return int(live_data) if live_data else 0
+            except Exception:
                 return 0
-            
-            live_data = data.get("data")
-            return int(live_data) if live_data else 0
     
     async def broadcast_detail(self, session: aiohttp.ClientSession, live_id: int) -> dict[str, Any] | None:
         """Step 3: Get authoritative broadcast details and stream URLs.
@@ -130,6 +216,7 @@ class BuzzCastClient:
             await self.init_tourist(session)
         
         url = f"{FACE_URL}/tokens/live/broadcast/detail"
+        proxy = self.current_proxy or self.proxy_manager.get_random_proxy()
         
         # Try different liveType values (0=normal, 1=voice, 2=PK, 3=game)
         for live_type in (0, 1, 2, 3):
@@ -141,7 +228,13 @@ class BuzzCastClient:
             }
             
             try:
-                async with session.post(url, json=payload, headers=self._headers(), timeout=30) as resp:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers=self._headers(),
+                    timeout=30,
+                    proxy=proxy
+                ) as resp:
                     data = await resp.json()
                     
                     # Get result - could be in "result" or "data" field
@@ -160,6 +253,19 @@ class BuzzCastClient:
                             return result
             except Exception as e:
                 print(f"[BuzzCast] broadcast_detail liveType={live_type} error: {e}")
+                # Try without proxy on error
+                if proxy and live_type == 0:  # Only retry first type without proxy
+                    try:
+                        async with session.post(url, json=payload, headers=self._headers(), timeout=30) as resp:
+                            data = await resp.json()
+                            result = data.get("result") if "result" in data else data.get("data")
+                            if result:
+                                status = result.get("status")
+                                live_info = result.get("live")
+                                if status == 1 and live_info:
+                                    return result
+                    except Exception:
+                        pass
                 continue
         
         # No active stream found
