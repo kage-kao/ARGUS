@@ -268,7 +268,7 @@ class BuzzCastClient:
         if stream_url:
             print(f"[BuzzCast] ✅ {user_id} LIVE | {stream_url[:80]}...")
             return stream_url, live_info
-        print(f"[BuzzCast] ⚠️ live but no stream URL in response")
+        print("[BuzzCast] ⚠️ live but no stream URL in response")
         return None, live_info
 
     async def search_user(self, session: aiohttp.ClientSession | None,

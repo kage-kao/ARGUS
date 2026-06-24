@@ -32,10 +32,97 @@ die()  { echo "${c_red}[ERR]${c_reset} $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 log "1/6 Установка системных пакетов…"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q
-apt-get install -y -q \
+export NEEDRESTART_MODE=a            # авто-перезапуск сервисов (Ubuntu 22.04+)
+
+# --- dpkg/apt-lock handling -------------------------------------------------
+# После свежей загрузки сервера дeb-системы запускают `unattended-upgrades`,
+# который держит /var/lib/dpkg/lock-frontend → твой apt-get install падает с
+# `E: Could not get lock /var/lib/dpkg/lock-frontend`. Ждём освобождения и в
+# крайнем случае останавливаем фоновые apt-сервисы.
+
+APT_LOCKS=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/lib/apt/lists/lock
+    /var/cache/apt/archives/lock
+)
+
+apt_lock_held() {
+    local lock
+    for lock in "${APT_LOCKS[@]}"; do
+        [ -e "$lock" ] || continue
+        if command -v fuser >/dev/null 2>&1 && fuser "$lock" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+wait_for_apt_lock() {
+    local waited=0
+    local max_wait="${APT_LOCK_TIMEOUT:-600}"   # сек, по умолчанию 10 мин
+    apt_lock_held || return 0
+    warn "dpkg/apt lock занят (обычно это unattended-upgrades). Жду до ${max_wait}s…"
+    while apt_lock_held; do
+        sleep 5
+        waited=$((waited + 5))
+        if [ "$waited" -ge "$max_wait" ]; then
+            warn "lock не освободился за ${max_wait}s — останавливаю фоновые apt-сервисы"
+            systemctl stop --now unattended-upgrades.service                  2>/dev/null || true
+            systemctl stop --now apt-daily.timer apt-daily.service            2>/dev/null || true
+            systemctl stop --now apt-daily-upgrade.timer apt-daily-upgrade.service 2>/dev/null || true
+            # ядерный вариант — снести владельца lock-файла
+            local lock pid
+            for lock in "${APT_LOCKS[@]}"; do
+                [ -e "$lock" ] || continue
+                if command -v fuser >/dev/null 2>&1; then
+                    pid="$(fuser "$lock" 2>/dev/null | tr -d ' :' || true)"
+                    if [ -n "$pid" ]; then
+                        warn "lock держит PID=$pid, шлю SIGTERM"
+                        kill -TERM "$pid" 2>/dev/null || true
+                    fi
+                fi
+            done
+            sleep 5
+            break
+        fi
+    done
+}
+
+# apt с retry'ями и встроенным Dpkg::Lock::Timeout (apt >= 1.9.11 / bullseye+).
+apt_run() {
+    local attempt=1
+    local max_attempts=4
+    local rc=0
+    while true; do
+        wait_for_apt_lock
+        if apt-get -o Dpkg::Lock::Timeout=600 \
+                   -o Dpkg::Options::=--force-confdef \
+                   -o Dpkg::Options::=--force-confold \
+                   "$@"; then
+            return 0
+        fi
+        rc=$?
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            return "$rc"
+        fi
+        warn "apt-get '$*' упал (rc=$rc), попытка $attempt/$max_attempts через 10s…"
+        attempt=$((attempt + 1))
+        sleep 10
+    done
+}
+
+# psmisc даёт `fuser`, без него мы не сможем определить владельца lock-файла.
+# Ставим его при первом же запуске (если ещё нет).
+if ! command -v fuser >/dev/null 2>&1; then
+    apt_run update -q || true
+    apt_run install -y -q psmisc || true
+fi
+
+apt_run update -q
+apt_run install -y -q \
     python3 python3-venv python3-pip \
-    ffmpeg curl ca-certificates tar
+    ffmpeg curl ca-certificates tar psmisc
 ok "пакеты установлены"
 
 # ---------------------------------------------------------------------------
@@ -48,7 +135,9 @@ rm -f "/etc/systemd/system/$SERVICE"
 systemctl daemon-reload
 # НЕ сохраняем старый .env - всегда запрашиваем токен заново
 rm -rf "$APP_DIR"
-id -u "$APP_USER" >/dev/null 2>&1 && userdel "$APP_USER" 2>/dev/null || true
+if id -u "$APP_USER" >/dev/null 2>&1; then
+    userdel "$APP_USER" 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 # 3) Запрос токена бота (интерактивно через /dev/tty)
@@ -68,7 +157,7 @@ else
     echo "  Формат:  123456789:ABCdefGhIJKlmNoPQRstuVWXyz"
     echo
     while [ -z "$TOKEN" ]; do
-        printf "${c_yellow}>>> Вставь Telegram bot token и нажми Enter: ${c_reset}"
+        printf '%s>>> Вставь Telegram bot token и нажми Enter: %s' "$c_yellow" "$c_reset"
         # Read from controlling tty so curl|bash works
         if [ -r /dev/tty ]; then
             read -r TOKEN </dev/tty || true
@@ -100,7 +189,9 @@ SRC_DIR="/tmp/${REPO_NAME}-${REPO_BRANCH}"
 mkdir -p "$APP_DIR"
 cp -r "$SRC_DIR/argus_bot" "$APP_DIR/"
 cp "$SRC_DIR/requirements.txt" "$APP_DIR/"
-[ -f "$SRC_DIR/README.md" ] && cp "$SRC_DIR/README.md" "$APP_DIR/" || true
+if [ -f "$SRC_DIR/README.md" ]; then
+    cp "$SRC_DIR/README.md" "$APP_DIR/" || true
+fi
 mkdir -p "$APP_DIR/work"
 rm -rf "$SRC_DIR"
 
