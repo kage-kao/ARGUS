@@ -35,10 +35,9 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a            # авто-перезапуск сервисов (Ubuntu 22.04+)
 
 # --- dpkg/apt-lock handling -------------------------------------------------
-# После свежей загрузки сервера дeb-системы запускают `unattended-upgrades`,
-# который держит /var/lib/dpkg/lock-frontend → твой apt-get install падает с
-# `E: Could not get lock /var/lib/dpkg/lock-frontend`. Ждём освобождения и в
-# крайнем случае останавливаем фоновые apt-сервисы.
+# Свежий debian/ubuntu сразу после установки запускает unattended-upgrades,
+# который держит /var/lib/dpkg/lock-frontend. Не ждём, сразу прибиваем всех,
+# кто мешает.
 
 APT_LOCKS=(
     /var/lib/dpkg/lock-frontend
@@ -47,46 +46,36 @@ APT_LOCKS=(
     /var/cache/apt/archives/lock
 )
 
-apt_lock_held() {
-    local lock
-    for lock in "${APT_LOCKS[@]}"; do
-        [ -e "$lock" ] || continue
-        if command -v fuser >/dev/null 2>&1 && fuser "$lock" >/dev/null 2>&1; then
-            return 0
-        fi
-    done
-    return 1
-}
+kill_apt_blockers() {
+    # 1) Остановить и замаскировать фоновые apt-сервисы
+    systemctl kill --signal=SIGKILL unattended-upgrades.service           2>/dev/null || true
+    systemctl stop --now unattended-upgrades.service                      2>/dev/null || true
+    systemctl mask unattended-upgrades.service                            2>/dev/null || true
+    systemctl stop --now apt-daily.timer apt-daily.service                2>/dev/null || true
+    systemctl stop --now apt-daily-upgrade.timer apt-daily-upgrade.service 2>/dev/null || true
 
-wait_for_apt_lock() {
-    local waited=0
-    local max_wait="${APT_LOCK_TIMEOUT:-600}"   # сек, по умолчанию 10 мин
-    apt_lock_held || return 0
-    warn "dpkg/apt lock занят (обычно это unattended-upgrades). Жду до ${max_wait}s…"
-    while apt_lock_held; do
-        sleep 5
-        waited=$((waited + 5))
-        if [ "$waited" -ge "$max_wait" ]; then
-            warn "lock не освободился за ${max_wait}s — останавливаю фоновые apt-сервисы"
-            systemctl stop --now unattended-upgrades.service                  2>/dev/null || true
-            systemctl stop --now apt-daily.timer apt-daily.service            2>/dev/null || true
-            systemctl stop --now apt-daily-upgrade.timer apt-daily-upgrade.service 2>/dev/null || true
-            # ядерный вариант — снести владельца lock-файла
-            local lock pid
-            for lock in "${APT_LOCKS[@]}"; do
-                [ -e "$lock" ] || continue
-                if command -v fuser >/dev/null 2>&1; then
-                    pid="$(fuser "$lock" 2>/dev/null | tr -d ' :' || true)"
-                    if [ -n "$pid" ]; then
-                        warn "lock держит PID=$pid, шлю SIGTERM"
-                        kill -TERM "$pid" 2>/dev/null || true
-                    fi
-                fi
-            done
-            sleep 5
-            break
-        fi
-    done
+    # 2) Прибить всё, что может держать apt/dpkg lock
+    pkill -9 -f unattended-upgrade 2>/dev/null || true
+    pkill -9 -x apt-get            2>/dev/null || true
+    pkill -9 -x aptitude           2>/dev/null || true
+    pkill -9 -x apt                2>/dev/null || true
+    pkill -9 -x dpkg               2>/dev/null || true
+
+    # 3) Если кто-то ещё держит lock-файл — SIGKILL по PID из fuser
+    if command -v fuser >/dev/null 2>&1; then
+        local lock pid
+        for lock in "${APT_LOCKS[@]}"; do
+            [ -e "$lock" ] || continue
+            pid="$(fuser "$lock" 2>/dev/null | tr -d ' :' || true)"
+            if [ -n "$pid" ]; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # 4) Снести сами lock-файлы и починить, если dpkg оборвался
+    rm -f "${APT_LOCKS[@]}" 2>/dev/null || true
+    dpkg --configure -a 2>/dev/null || true
 }
 
 # apt с retry'ями и встроенным Dpkg::Lock::Timeout (apt >= 1.9.11 / bullseye+).
@@ -95,8 +84,8 @@ apt_run() {
     local max_attempts=4
     local rc=0
     while true; do
-        wait_for_apt_lock
-        if apt-get -o Dpkg::Lock::Timeout=600 \
+        kill_apt_blockers
+        if apt-get -o Dpkg::Lock::Timeout=10 \
                    -o Dpkg::Options::=--force-confdef \
                    -o Dpkg::Options::=--force-confold \
                    "$@"; then
@@ -106,17 +95,17 @@ apt_run() {
         if [ "$attempt" -ge "$max_attempts" ]; then
             return "$rc"
         fi
-        warn "apt-get '$*' упал (rc=$rc), попытка $attempt/$max_attempts через 10s…"
+        warn "apt-get '$*' упал (rc=$rc), убиваю lock-холдеров и пробую снова ($attempt/$max_attempts)…"
         attempt=$((attempt + 1))
-        sleep 10
+        sleep 2
     done
 }
 
-# psmisc даёт `fuser`, без него мы не сможем определить владельца lock-файла.
-# Ставим его при первом же запуске (если ещё нет).
+# psmisc даёт `fuser`, без него мы не определим владельца lock-файла.
 if ! command -v fuser >/dev/null 2>&1; then
-    apt_run update -q || true
-    apt_run install -y -q psmisc || true
+    kill_apt_blockers
+    apt-get -o Dpkg::Lock::Timeout=10 update -q || true
+    apt-get -o Dpkg::Lock::Timeout=10 install -y -q psmisc || true
 fi
 
 apt_run update -q
