@@ -20,7 +20,9 @@ async def upload_ranoz(session: aiohttp.ClientSession, path: Path) -> str:
         json={"filename": name, "size": size},
         timeout=aiohttp.ClientTimeout(total=60),
     ) as r:
-        data = await r.json()
+        # ranoz сейчас отдаёт корректный JSON, но с mimetype text/plain —
+        # aiohttp по умолчанию на это ругается, отключаем строгую проверку.
+        data = await r.json(content_type=None)
     upload_url = data.get("data", {}).get("upload_url")
     file_url = data.get("data", {}).get("url")
     if not upload_url or not file_url:
