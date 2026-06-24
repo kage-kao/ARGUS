@@ -92,19 +92,19 @@ async def run_pipeline(job_id: str, stream_url: str, hosters: List[str],
             raise asyncio.CancelledError()
 
         # ---------- Compression ----------
-        resolution, bitrate, q_label = config.QUALITY_PRESETS[quality]
+        tier_p, bitrate, q_label = config.QUALITY_PRESETS[quality]
         await _maybe(progress,
                      f"📦 Сегментов: {len(segs)}. Сжимаю через ezgif "
-                     f"({resolution} · {bitrate}kbps)...")
+                     f"(до {tier_p}p · {bitrate}kbps, пропорции сохраняются)...")
 
         async def ez_progress(done: int, total: int):
             storage.update(job_id, progress=f"ezgif {done}/{total}")
             await _maybe(progress, f"🗜 ezgif: {done}/{total} сжато "
-                                   f"({resolution} · {bitrate}kbps)")
+                                   f"(до {tier_p}p · {bitrate}kbps)")
 
         cz_dir = work / "cz"
         compressed = await compressor.compress_segments(
-            segs, cz_dir, resolution, bitrate, ez_progress
+            segs, cz_dir, tier_p, bitrate, ez_progress
         )
         if registry.cancelled:
             raise asyncio.CancelledError()

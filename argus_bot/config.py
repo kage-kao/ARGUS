@@ -34,12 +34,15 @@ TEMPSHARE_MAX = 2_000_000_000    # 2.00 GB
 EZGIF_SEG_MAX = 199 * 1024 * 1024
 EZGIF_FORMAT = os.environ.get("EZGIF_FORMAT", "mp4")
 
-# Quality presets for ezgif compression. id -> (resolution, bitrate_kbps, label)
-QUALITY_PRESETS: dict[str, tuple[str, str, str]] = {
-    "high":   ("1280x720", "1500", "🎬 High — 720p · 1500 kbps"),
-    "medium": ("854x480",  "800",  "📺 Medium — 480p · 800 kbps"),
-    "low":    ("640x360",  "400",  "📱 Low — 360p · 400 kbps"),
-    "tiny":   ("426x240",  "200",  "🪶 Tiny — 240p · 200 kbps"),
+# Quality presets for ezgif compression. id -> (tier_p, bitrate_kbps, label)
+# tier_p — это ПОТОЛОК по короткой стороне (720/480/360/240). Реальное
+# разрешение ezgif подбирается под пропорции исходника в compressor.py,
+# поэтому видео НЕ растягивается (никакой «моноширности»).
+QUALITY_PRESETS: dict[str, tuple[int, str, str]] = {
+    "high":   (720, "1500", "🎬 High — до 720p · 1500 kbps"),
+    "medium": (480, "800",  "📺 Medium — до 480p · 800 kbps"),
+    "low":    (360, "400",  "📱 Low — до 360p · 400 kbps"),
+    "tiny":   (240, "200",  "🪶 Tiny — до 240p · 200 kbps"),
 }
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", "low")
 

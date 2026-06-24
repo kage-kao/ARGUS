@@ -1,4 +1,23 @@
-"""Compress mp4 segments via ezgif.com/video-compressor (no API key)."""
+"""Compress mp4 segments via ezgif.com/video-compressor (no API key).
+
+ВАЖНО про разрешение / пропорции:
+
+ezgif принимает ТОЛЬКО фиксированные значения `resolution` из своего
+выпадающего списка и ЖЁСТКО растягивает видео под эти размеры (aspect ratio
+НЕ сохраняется — проверено). Если послать произвольное `WxH` (которого нет
+в списке) — ezgif молча игнорирует и берёт дефолт `1280x720`, из-за чего
+вертикальный стрим становится «моноширным»/растянутым.
+
+Поэтому мы:
+  1. Узнаём реальные W×H исходника через ffprobe.
+  2. Выбираем из РАЗРЕШЁННОГО списка ezgif вариант той же ориентации и
+     ближайшего соотношения сторон (16:9 / 9:16 / 4:3) — так пропорции
+     сохраняются, картинка не растягивается.
+  3. Никогда не апскейлим: если выбранный «потолок» качества больше
+     исходника — спускаемся на тир ниже (только сжатие, не расширение).
+
+Локального ffmpeg-перекодирования здесь НЕТ — всё сжатие делает ezgif.
+"""
 from __future__ import annotations
 import asyncio
 import logging
@@ -10,7 +29,7 @@ import aiohttp
 import aiofiles
 from bs4 import BeautifulSoup
 
-from . import config
+from . import config, ffwrap
 
 log = logging.getLogger("argus.compress")
 
@@ -19,6 +38,51 @@ UPLOAD_URL = f"{EZGIF_BASE}/video-compressor"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ARGUS-Bot/2.0"
 
 _FILE_ID_RE = re.compile(r"ezgif-[a-f0-9]{16}")
+
+# Разрешения, которые ezgif/video-compressor реально принимает (из <select>).
+# tier (короткая сторона, «p») -> список (w, h) допустимых вариантов.
+# Любое другое значение ezgif игнорирует и ставит дефолт 1280x720.
+EZGIF_RESOLUTIONS: dict[int, list[tuple[int, int]]] = {
+    1440: [(2560, 1440), (1440, 2560)],
+    1080: [(1920, 1080), (1080, 1920)],
+    720:  [(1280, 720),  (720, 1280)],
+    480:  [(854, 480),   (480, 854)],
+    360:  [(640, 360),   (360, 640)],
+    240:  [(426, 240),   (240, 426), (320, 240), (240, 320)],
+}
+_TIER_ORDER = [1440, 1080, 720, 480, 360, 240]
+
+
+def pick_resolution(width: int, height: int, tier_p: int) -> str:
+    """Вернуть строку 'WxH' из допустимого списка ezgif, которая:
+      • сохраняет ориентацию и максимально близка к соотношению сторон
+        исходника (без растягивания/«моноширности»);
+      • не превышает выбранный пользователем тир качества (`tier_p`);
+      • не апскейлит исходник (только уменьшение / сжатие).
+    """
+    if width <= 0 or height <= 0:
+        # не смогли распознать размеры — берём ориентацию-нейтральный 16:9
+        opts = EZGIF_RESOLUTIONS.get(tier_p, EZGIF_RESOLUTIONS[720])
+        w, h = opts[0]
+        return f"{w}x{h}"
+
+    src_ar = width / height
+    src_short = min(width, height)
+
+    # перебираем выбранный тир и все, что НИЖЕ него (потолок = выбор юзера)
+    for t in [t for t in _TIER_ORDER if t <= tier_p]:
+        # ближайшее по соотношению сторон (ориентация подбирается автоматически)
+        best = min(EZGIF_RESOLUTIONS[t],
+                   key=lambda wh: abs((wh[0] / wh[1]) - src_ar))
+        # не апскейлим: короткая сторона варианта должна влезать в исходник
+        if min(best) <= src_short:
+            return f"{best[0]}x{best[1]}"
+
+    # исходник мельче самого маленького тира — берём минимальный по размеру
+    # вариант нужной ориентации (лёгкий апскейл неизбежен, случай редкий)
+    best = min(EZGIF_RESOLUTIONS[240],
+               key=lambda wh: (abs((wh[0] / wh[1]) - src_ar), wh[0] * wh[1]))
+    return f"{best[0]}x{best[1]}"
 
 
 async def _upload(session: aiohttp.ClientSession,
@@ -129,9 +193,18 @@ async def _download_save(session: aiohttp.ClientSession, save_name: str,
 
 
 async def compress_one(session: aiohttp.ClientSession, src: Path,
-                       dst: Path, resolution: str, bitrate: str) -> Path:
-    """Upload → recompress → download. На неудаче кидает RuntimeError —
-    caller (compress_segments) сделает fallback на оригинал."""
+                       dst: Path, tier_p: int, bitrate: str) -> Path:
+    """Upload → recompress → download через ezgif.
+
+    Разрешение подбирается ПОД ИСХОДНИК (сохраняя пропорции), а не жёстко.
+    На неудаче кидает RuntimeError — caller (compress_segments) сделает
+    fallback на оригинал.
+    """
+    w, h = await ffwrap.probe_dimensions(src)
+    resolution = pick_resolution(w, h, tier_p)
+    log.info("ezgif: %s (%dx%d) -> resolution=%s @ %skbps",
+             src.name, w, h, resolution, bitrate)
+
     file_field, original_id, result_url = await _upload(session, src)
     save_name = await _recompress(
         session,
@@ -145,10 +218,12 @@ async def compress_one(session: aiohttp.ClientSession, src: Path,
 
 
 async def compress_segments(segments: list[Path], out_dir: Path,
-                            resolution: str, bitrate: str,
+                            tier_p: int, bitrate: str,
                             on_progress=None) -> list[Path]:
-    """Сжать каждый сегмент параллельно (ограничено EZGIF_PARALLEL).
-    Если сегмент не сжался — оставляем оригинал, чтобы не терять весь стрим.
+    """Сжать каждый сегмент через ezgif параллельно (ограничено EZGIF_PARALLEL).
+    Разрешение под каждый сегмент подбирается из его реальных размеров
+    (пропорции сохраняются). Если сегмент не сжался — оставляем оригинал,
+    чтобы не терять весь стрим.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     sem = asyncio.Semaphore(max(1, config.EZGIF_PARALLEL))
@@ -163,7 +238,7 @@ async def compress_segments(segments: list[Path], out_dir: Path,
             async with sem:
                 target = out_dir / f"cz_{i:03d}.{config.EZGIF_FORMAT}"
                 try:
-                    await compress_one(session, p, target, resolution, bitrate)
+                    await compress_one(session, p, target, tier_p, bitrate)
                     results[i] = target
                 except Exception as e:  # noqa: BLE001
                     log.warning("ezgif compress segment %d failed: %s — "

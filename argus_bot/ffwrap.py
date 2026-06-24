@@ -160,6 +160,21 @@ async def probe_duration(path: Path) -> float:
         return 0.0
 
 
+async def probe_dimensions(path: Path) -> tuple[int, int]:
+    """Вернуть (width, height) первого видеопотока. (0, 0) если не удалось."""
+    rc, out, _ = await _run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path),
+    ])
+    if rc != 0:
+        return 0, 0
+    try:
+        w, h = out.decode().strip().split(",")[:2]
+        return int(w), int(h)
+    except Exception:
+        return 0, 0
+
+
 async def split_copy(src: Path, max_bytes: int, out_pattern: Path,
                      registry: "ProcRegistry | None" = None) -> List[Path]:
     """Split via ffmpeg -c copy into segments roughly <= max_bytes."""
