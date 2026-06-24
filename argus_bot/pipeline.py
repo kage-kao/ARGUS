@@ -159,10 +159,19 @@ async def run_pipeline(job_id: str, stream_url: str, hosters: List[str],
         await _maybe(progress, f"❌ Ошибка: {e}")
     finally:
         res.elapsed = time.time() - started
-        if res.ok:
-            shutil.rmtree(work, ignore_errors=True)
-        elif res.cancelled:
-            # also clean up cancelled work dirs to avoid disk bloat
-            shutil.rmtree(work, ignore_errors=True)
+        # Always nuke the work dir — success, cancel, OR failure (so that a
+        # crashed recording does not eat the disk forever). The actual error
+        # is already persisted in the DB via storage.update(status='failed').
+        # On failure, preserve the tail of ytdlp.log (≤4 KB) in a central
+        # /errors/ folder for postmortem — costs almost nothing.
+        if not res.ok and not res.cancelled and log.exists():
+            try:
+                err_dir = config.WORK_DIR.parent / "errors"
+                err_dir.mkdir(parents=True, exist_ok=True)
+                tail = log.read_bytes()[-4096:]
+                (err_dir / f"{job_id}.log").write_bytes(tail)
+            except OSError:
+                pass
+        shutil.rmtree(work, ignore_errors=True)
 
     return res

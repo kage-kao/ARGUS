@@ -20,7 +20,7 @@ from aiogram.types import (
 
 import aiohttp
 
-from . import config, pipeline, storage, ffwrap, buzzcast_client
+from . import config, pipeline, storage, ffwrap, buzzcast_client, cleanup
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,6 +141,28 @@ async def cmd_status(m: Message) -> None:
     lines.append("")
     lines.append("Отменить:  /cancel &lt;job_id&gt;")
     await m.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_cleanup(m: Message) -> None:
+    """Manual disk cleanup — removes any orphan work/ folders."""
+    try:
+        removed, freed = await asyncio.to_thread(cleanup.cleanup_orphans)
+    except Exception as e:
+        log.exception("manual cleanup failed")
+        await m.answer(f"❌ Ошибка очистки: {e}")
+        return
+    if removed == 0:
+        await m.answer("✨ Чисто — нечего удалять.")
+        return
+    f = float(freed)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024:
+            human = f"{f:.1f} {u}"
+            break
+        f /= 1024
+    else:
+        human = f"{f:.1f} PB"
+    await m.answer(f"🧹 Удалено {removed} осиротевших папок, освобождено {human}.")
 
 
 async def cmd_cancel(m: Message, command: CommandObject) -> None:
@@ -827,6 +849,15 @@ async def main() -> None:
     if n:
         log.warning("marked %d stale active job(s) as 'interrupted'", n)
 
+    # Startup orphan sweep — must run AFTER mark_stale_interrupted so that
+    # interrupted-job folders are no longer "active" and get removed.
+    try:
+        removed, freed = cleanup.cleanup_orphans()
+        if removed:
+            log.warning("startup cleanup: removed %d orphan work dir(s)", removed)
+    except Exception:
+        log.exception("startup cleanup failed (continuing)")
+
     bot = Bot(config.BOT_TOKEN,
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
@@ -834,6 +865,7 @@ async def main() -> None:
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_status, Command("status"))
     dp.message.register(cmd_cancel, Command("cancel"))
+    dp.message.register(cmd_cleanup, Command("cleanup"))
     dp.message.register(cmd_buzzcast, Command("buzzcast"))
     dp.message.register(cmd_monitoring, Command("monitoring"))
     dp.message.register(on_url, F.text)
@@ -845,14 +877,16 @@ async def main() -> None:
 
     log.info("ARGUS bot starting…")
     
-    # Start monitoring background task
+    # Background tasks
     monitoring_task = asyncio.create_task(monitoring_loop(bot))
+    cleanup_task = asyncio.create_task(cleanup.cleanup_loop())
     
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
         monitoring_task.cancel()
+        cleanup_task.cancel()
 
 
 if __name__ == "__main__":
