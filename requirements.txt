@@ -1,0 +1,8 @@
+aiogram==3.13.1
+aiohttp==3.10.10
+aiohttp-socks==0.9.0
+aiofiles==24.1.0
+python-dotenv==1.0.1
+beautifulsoup4==4.12.3
+yt-dlp>=2024.10.7
+psutil>=6.0.0
