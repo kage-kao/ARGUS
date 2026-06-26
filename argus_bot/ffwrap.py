@@ -89,7 +89,16 @@ def _has_data(path: Path) -> bool:
 
 async def _ffmpeg_record(url: str, out_path: Path, log_path: Path,
                          registry: "ProcRegistry | None") -> int:
-    """Record a live stream losslessly via ffmpeg -c copy."""
+    """Record a live stream losslessly via ffmpeg -c copy.
+
+    FIX «хвоста»/гигантской длительности: у live FLV/RTMP (BuzzCast Tencent CDN)
+    исходные DTS/PTS часто битые — из-за разрыва или мусорного пакета в конце
+    контейнер показывает десятки часов, хотя данных ~10 минут. Поэтому для live
+    HTTP-потоков берём время прихода пакетов как таймстампы
+    (`-use_wallclock_as_timestamps 1`) и нормализуем старт в ноль
+    (`-avoid_negative_ts make_zero`). Запись остаётся lossless (`-c copy`),
+    а длительность получается равной реальному времени записи.
+    """
     is_http = url.lower().startswith(("http://", "https://"))
     base = url.lower().split("?", 1)[0]
     is_hls_ts = base.endswith((".m3u8", ".ts"))
@@ -101,8 +110,10 @@ async def _ffmpeg_record(url: str, out_path: Path, log_path: Path,
             "-headers", STREAM_HEADERS,
             "-rw_timeout", "20000000",
             "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            # см. docstring — чиним битые таймстампы источника
+            "-use_wallclock_as_timestamps", "1",
         ]
-    cmd += ["-i", url, "-c", "copy"]
+    cmd += ["-i", url, "-c", "copy", "-avoid_negative_ts", "make_zero"]
     if is_hls_ts:
         # ADTS AAC (HLS/TS) -> MP4 needs this bitstream filter
         cmd += ["-bsf:a", "aac_adtstoasc"]
