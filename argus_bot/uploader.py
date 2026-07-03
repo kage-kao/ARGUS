@@ -1,6 +1,7 @@
 """Upload to Ranoz (ranoz.gg), Tempshare (tempshare.su) and Gofile (gofile.io)."""
 from __future__ import annotations
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -9,6 +10,21 @@ import aiohttp
 import aiofiles
 
 from . import config
+
+
+async def _read_json(r: aiohttp.ClientResponse) -> dict:
+    """Безопасно распарсить JSON-ответ.
+
+    Раньше вызывали r.json() напрямую — при пустом/не-JSON ответе (5xx, HTML,
+    rate-limit, обрыв) это давало «Expecting value: line 1 column 1 (char 0)».
+    Теперь читаем текст и, если это не JSON, кидаем понятную ошибку со статусом
+    и куском тела."""
+    body = await r.text()
+    try:
+        return json.loads(body)
+    except Exception:
+        snippet = (body or "").strip()[:200]
+        raise RuntimeError(f"HTTP {r.status}, не-JSON ответ: {snippet!r}")
 
 
 async def upload_ranoz(session: aiohttp.ClientSession, path: Path) -> str:
@@ -22,9 +38,7 @@ async def upload_ranoz(session: aiohttp.ClientSession, path: Path) -> str:
         json={"filename": name, "size": size},
         timeout=aiohttp.ClientTimeout(total=60),
     ) as r:
-        # ranoz сейчас отдаёт корректный JSON, но с mimetype text/plain —
-        # aiohttp по умолчанию на это ругается, отключаем строгую проверку.
-        data = await r.json(content_type=None)
+        data = await _read_json(r)
     upload_url = data.get("data", {}).get("upload_url")
     file_url = data.get("data", {}).get("url")
     if not upload_url or not file_url:
@@ -63,7 +77,7 @@ async def upload_tempshare(session: aiohttp.ClientSession, path: Path,
             data=form,
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=1800),
         ) as r:
-            data = await r.json(content_type=None)
+            data = await _read_json(r)
     finally:
         fh.close()
     if not data.get("success") or not data.get("url"):
@@ -71,11 +85,14 @@ async def upload_tempshare(session: aiohttp.ClientSession, path: Path,
     return data["url"]
 
 
+# ---------------------------------------------------------------------------
+# Gofile (анонимно) — авто-выбор быстрой зоны + перебор серверов при сбое
+# ---------------------------------------------------------------------------
 async def _gofile_fetch_servers(session: aiohttp.ClientSession) -> list[dict]:
     """Список серверов Gofile с зонами: [{'name': 'store1', 'zone': 'eu'}, ...]."""
     async with session.get("https://api.gofile.io/servers",
                            timeout=aiohttp.ClientTimeout(total=30)) as r:
-        data = await r.json(content_type=None)
+        data = await _read_json(r)
     return (data.get("data") or {}).get("servers") or []
 
 
@@ -91,115 +108,114 @@ async def _gofile_latency(session: aiohttp.ClientSession, name: str) -> float:
         return float("inf")
 
 
-# Кэш выбранного сервера на процесс (TTL), чтобы не замерять перед каждой заливкой.
-_GOFILE_CACHE: dict[str, object] = {"name": None, "ts": 0.0}
+# Кэш упорядоченного списка серверов на процесс (TTL).
+_GOFILE_CACHE: dict[str, object] = {"servers": None, "ts": 0.0}
 _GOFILE_TTL = int(os.environ.get("GOFILE_CACHE_TTL", "600"))
 _GOFILE_LOCK = asyncio.Lock()
 
 
-async def _gofile_pick_server(session: aiohttp.ClientSession) -> str:
-    """Авто-выбор самого быстрого сервера Gofile по зоне.
+async def _gofile_server_candidates(session: aiohttp.ClientSession) -> list[str]:
+    """Упорядоченный список серверов: сначала самая быстрая зона, затем остальные.
 
-    Логика:
-      1. Если задан env GOFILE_ZONE (eu/na/ap/...), берём сервер из этой зоны.
-      2. Иначе замеряем задержку по одному представителю каждой зоны и
-         выбираем сервер из самой быстрой зоны.
-      3. Результат кэшируется на GOFILE_CACHE_TTL секунд.
-    Есть fallback на legacy /getServer, если /servers недоступен.
-    """
+    Порядок используется как список кандидатов — если аплоад на первый сервер
+    сорвётся (пустой/не-JSON ответ, 5xx), пробуем следующий."""
     now = time.monotonic()
-    cached = _GOFILE_CACHE.get("name")
+    cached = _GOFILE_CACHE.get("servers")
     if cached and (now - float(_GOFILE_CACHE.get("ts", 0.0))) < _GOFILE_TTL:
-        return str(cached)
+        return list(cached)  # type: ignore
 
     async with _GOFILE_LOCK:
-        # повторная проверка кэша после захвата лока
         now = time.monotonic()
-        cached = _GOFILE_CACHE.get("name")
+        cached = _GOFILE_CACHE.get("servers")
         if cached and (now - float(_GOFILE_CACHE.get("ts", 0.0))) < _GOFILE_TTL:
-            return str(cached)
+            return list(cached)  # type: ignore
 
-        servers: list[dict] = []
         try:
             servers = await _gofile_fetch_servers(session)
         except Exception:
             servers = []
 
-        chosen: str | None = None
+        ordered: list[str] = []
         if servers:
-            # Группируем по зонам.
             by_zone: dict[str, list[str]] = {}
             for s in servers:
                 name = s.get("name")
                 if name:
-                    by_zone.setdefault(s.get("zone") or "?", []).append(name)
+                    by_zone.setdefault((s.get("zone") or "?").lower(), []).append(name)
 
             pref = (os.environ.get("GOFILE_ZONE") or "").strip().lower()
+            zones = list(by_zone.keys())
             if pref and pref in by_zone:
-                chosen = by_zone[pref][0]
-            elif len(by_zone) == 1:
-                chosen = next(iter(by_zone.values()))[0]
-            else:
-                # Замеряем по одному представителю на зону → берём самую быструю.
-                zones = list(by_zone.keys())
+                zone_order = [pref] + [z for z in zones if z != pref]
+            elif len(zones) > 1:
                 reps = [by_zone[z][0] for z in zones]
-                latencies = await asyncio.gather(
-                    *(_gofile_latency(session, name) for name in reps)
-                )
-                best_i = min(range(len(zones)), key=lambda i: latencies[i])
-                if latencies[best_i] == float("inf"):
-                    chosen = reps[0]  # все недоступны — берём первый
-                else:
-                    chosen = by_zone[zones[best_i]][0]
+                lat = await asyncio.gather(
+                    *(_gofile_latency(session, n) for n in reps))
+                zone_order = [z for _, z in sorted(zip(lat, zones), key=lambda x: x[0])]
+            else:
+                zone_order = zones
 
-        if not chosen:
-            # Legacy fallback: /getServer -> {"data": "store1"} | {"data": {"server": ...}}
-            async with session.get("https://api.gofile.io/getServer",
-                                   timeout=aiohttp.ClientTimeout(total=30)) as r:
-                data = await r.json(content_type=None)
-            d = data.get("data")
-            chosen = d.get("server") if isinstance(d, dict) else d
-        if not chosen:
-            raise RuntimeError("gofile: no server available")
+            for z in zone_order:
+                ordered.extend(by_zone[z])
 
-        _GOFILE_CACHE["name"] = chosen
-        _GOFILE_CACHE["ts"] = time.monotonic()
-        return chosen
+        if ordered:
+            _GOFILE_CACHE["servers"] = ordered
+            _GOFILE_CACHE["ts"] = time.monotonic()
+        return ordered
 
 
 async def upload_gofile(session: aiohttp.ClientSession, path: Path, **_) -> str:
-    """Anonymous upload to Gofile. Returns public download page URL."""
-    server = await _gofile_pick_server(session)
-    endpoints = [
-        f"https://{server}.gofile.io/contents/uploadfile",  # current API
-        f"https://{server}.gofile.io/uploadFile",            # legacy API
-    ]
-    last: object = None
-    for url in endpoints:
-        form = aiohttp.FormData()
-        fh = open(path, "rb")
+    """Anonymous upload to Gofile. Пробует несколько серверов (быстрая зона →
+    остальные), устойчиво к пустым/не-JSON ответам. Returns download page URL."""
+    candidates = await _gofile_server_candidates(session)
+
+    # Legacy fallback, если /servers недоступен.
+    if not candidates:
         try:
-            form.add_field("file", fh, filename=path.name,
-                           content_type="application/octet-stream")
-            async with session.post(
-                url, data=form,
-                timeout=aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=1800),
-            ) as r:
-                data = await r.json(content_type=None)
-        except Exception as e:  # noqa: BLE001
+            async with session.get("https://api.gofile.io/getServer",
+                                   timeout=aiohttp.ClientTimeout(total=30)) as r:
+                data = await _read_json(r)
+            d = data.get("data")
+            srv = d.get("server") if isinstance(d, dict) else d
+            if srv:
+                candidates = [srv]
+        except Exception:
+            candidates = []
+
+    if not candidates:
+        raise RuntimeError("gofile: не удалось получить список серверов")
+
+    last: object = None
+    for srv in candidates[:5]:
+        url = f"https://{srv}.gofile.io/contents/uploadfile"
+        try:
+            form = aiohttp.FormData()
+            fh = open(path, "rb")
+            try:
+                form.add_field("file", fh, filename=path.name,
+                               content_type="application/octet-stream")
+                async with session.post(
+                    url, data=form,
+                    timeout=aiohttp.ClientTimeout(total=None, sock_connect=60,
+                                                  sock_read=1800),
+                ) as r:
+                    data = await _read_json(r)
+            finally:
+                fh.close()
+        except Exception as e:  # noqa: BLE001 — пробуем следующий сервер
             last = e
             continue
-        finally:
-            fh.close()
+
         if data.get("status") == "ok":
             dd = data.get("data", {}) or {}
             link = dd.get("downloadPage") or dd.get("downloadpage")
             if link:
                 return link
-        last = data
-    # сбрасываем кэш, чтобы следующая попытка выбрала другой сервер
-    _GOFILE_CACHE["name"] = None
-    raise RuntimeError(f"gofile: upload failed: {last}")
+        last = RuntimeError(f"gofile {srv}: {str(data)[:200]}")
+
+    # все кандидаты сорвались — сбрасываем кэш, чтобы в следующий раз перечитать
+    _GOFILE_CACHE["servers"] = None
+    raise RuntimeError(f"gofile: upload failed on {len(candidates[:5])} server(s): {last}")
 
 
 HOSTERS = {
