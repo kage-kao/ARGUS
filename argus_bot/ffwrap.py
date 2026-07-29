@@ -7,11 +7,14 @@
 """
 from __future__ import annotations
 import asyncio
+import logging
 import os
 import shlex
 import signal
 from pathlib import Path
 from typing import List
+
+log = logging.getLogger("argus.ffwrap")
 
 STREAM_UA = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"
 STREAM_HEADERS = "Referer: https://www.buzzcast.com/\r\nOrigin: https://www.buzzcast.com\r\n"
@@ -223,10 +226,21 @@ async def probe_true_duration(path: Path) -> float:
 
 
 def _duration_is_sane(container: float, true_dur: float) -> bool:
-    """Контейнерная длительность вменяема относительно истинной."""
+    """Контейнерная длительность вменяема относительно истинной.
+
+    Проверяет ОБА направления:
+      - «хвост» (container >> true) — битые pts раздувают mp4 до 10ч;
+      - «схлопывание» (container << true) — концат-copy теряет duration и
+        всё видео проигрывается за 2 секунды хотя пакеты все на месте.
+    """
     if true_dur <= 0:
         return container > 0  # нет эталона — доверяем контейнеру, если он есть
-    return 0 < container <= max(true_dur * 1.5, true_dur + 30)
+    # Берём более мягкую границу из двух:
+    #   50% — для длинных записей (устойчиво к джиттеру пары минут),
+    #   ±60 сек — для очень коротких (5-мин видео с 50% допуском = 2.5мин, злоупотребление).
+    lo = min(true_dur * 0.5, true_dur - 60)
+    hi = max(true_dur * 1.5, true_dur + 60)
+    return lo <= container <= hi
 
 
 async def normalize_recording(raw: Path,
@@ -245,6 +259,8 @@ async def normalize_recording(raw: Path,
     container = await probe_duration(raw)
     if _duration_is_sane(container, true_dur):
         return raw  # всё ок — ничего не трогаем
+    log.warning("normalize_recording(%s): container=%.1fs, true=%.1fs — фиксим",
+                raw.name, container, true_dur)
 
     fps = await _probe_fps(raw)
     fps_arg = f"{fps:.4f}" if fps and fps > 0 else "30"
@@ -272,6 +288,7 @@ async def normalize_recording(raw: Path,
         "-fflags", "+genpts", "-i", str(raw), "-map", "0", "-c", "copy",
         "-map_metadata", "-1", "-movflags", "+faststart", str(fix1),
     ], fix1):
+        log.info("normalize_recording(%s): стратегия 1 (remux+genpts) — OK", raw.name)
         return raw
 
     # --- стратегия 2: видео copy + аудио async resample --------------------
@@ -284,6 +301,7 @@ async def normalize_recording(raw: Path,
         "-af", "aresample=async=1:first_pts=0",
         "-map_metadata", "-1", "-movflags", "+faststart", str(fix2),
     ], fix2):
+        log.info("normalize_recording(%s): стратегия 2 (audio resample) — OK", raw.name)
         return raw
 
     # --- стратегия 3: переэнкод с пересчётом таймстампов по индексу кадра ---
@@ -301,8 +319,10 @@ async def normalize_recording(raw: Path,
         "-c:a", "aac", "-b:a", "128k",
         "-map_metadata", "-1", "-movflags", "+faststart", str(fix3),
     ], fix3):
+        log.info("normalize_recording(%s): стратегия 3 (full re-encode) — OK", raw.name)
         return raw
 
+    log.error("normalize_recording(%s): ВСЕ 3 стратегии провалились", raw.name)
     return raw  # не удалось починить — оставляем как есть
 
 

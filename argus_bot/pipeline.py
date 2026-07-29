@@ -132,6 +132,10 @@ async def run_pipeline(job_id: str, stream_url: str, hosters: List[str],
         await _maybe(progress, "🧩 Склеиваю сжатые части в один файл...")
         merged = work / "merged.mp4"
         await ffwrap.concat_copy(compressed, merged, registry=registry)
+        # После склейки таймстампы сегментов могут не сойтись → контейнер
+        # покажет либо «10 часов», либо «2 секунды». Второй проход нормализации
+        # чинит оба случая (см. _duration_is_sane).
+        merged = await ffwrap.normalize_recording(merged, registry=registry)
         res.final_size = merged.stat().st_size
         await _maybe(progress, f"✅ Готовый файл: {_human(res.final_size)}")
         if registry.cancelled:
