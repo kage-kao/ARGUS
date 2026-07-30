@@ -88,58 +88,77 @@ async def run_pipeline(job_id: str, stream_url: str, hosters: List[str],
         # ---------- Splitting ----------
         storage.update(job_id, status="processing",
                        progress=f"recorded {_human(res.raw_size)}")
-        await _maybe(progress,
-                     f"✅ Запись завершена: {_human(res.raw_size)}, "
-                     f"длит. {int(res.duration_sec)}s. Режу на куски ≤199MB...")
 
-        seg_dir = work / "segs"
-        seg_dir.mkdir(exist_ok=True)
-        segs = await ffwrap.split_copy(raw, config.EZGIF_SEG_MAX,
-                                       seg_dir / "seg_%03d.mp4",
-                                       registry=registry)
-        if registry.cancelled:
-            raise asyncio.CancelledError()
-
-        # ---------- Compression ----------
+        # Skip compression entirely if the raw already fits the size target
+        # (режим `size:N` — user хотел ≤N МБ, не требовал определённого качества).
+        skip_compress = False
         if quality.startswith("size:"):
-            res.target_mb = int(quality.split(":", 1)[1])
-            tier_p, bitrate = compressor.plan_for_target_size(
-                res.target_mb, res.duration_sec)
-            comp_head = (f"🎯 цель ≤{res.target_mb} МБ → ~{bitrate}kbps "
-                         f"(до {tier_p}p, пропорции сохраняются)")
+            target_mb_early = int(quality.split(":", 1)[1])
+            if res.raw_size <= target_mb_early * 1_000_000:
+                skip_compress = True
+                res.target_mb = target_mb_early
+
+        if skip_compress:
+            merged = raw
+            res.final_size = res.raw_size
+            res.seg_total = 0
+            res.seg_fallback = 0
+            await _maybe(progress,
+                         f"✅ Запись {_human(res.raw_size)} уже ≤{res.target_mb} МБ — "
+                         f"сжатие пропущено.")
         else:
-            tier_p, bitrate, q_label = config.QUALITY_PRESETS[quality]
-            comp_head = f"до {tier_p}p · {bitrate}kbps, пропорции сохраняются"
+            await _maybe(progress,
+                         f"✅ Запись завершена: {_human(res.raw_size)}, "
+                         f"длит. {int(res.duration_sec)}s. Режу на куски ≤199MB...")
 
-        res.seg_total = len(segs)
-        await _maybe(progress,
-                     f"📦 Сегментов: {len(segs)}. Сжимаю через ezgif "
-                     f"({comp_head})...")
+            seg_dir = work / "segs"
+            seg_dir.mkdir(exist_ok=True)
+            segs = await ffwrap.split_copy(raw, config.EZGIF_SEG_MAX,
+                                           seg_dir / "seg_%03d.mp4",
+                                           registry=registry)
+            if registry.cancelled:
+                raise asyncio.CancelledError()
 
-        async def ez_progress(done: int, total: int):
-            storage.update(job_id, progress=f"ezgif {done}/{total}")
-            await _maybe(progress, f"🗜 ezgif: {done}/{total} сжато "
-                                   f"({comp_head})")
+            # ---------- Compression ----------
+            if quality.startswith("size:"):
+                res.target_mb = int(quality.split(":", 1)[1])
+                tier_p, bitrate = compressor.plan_for_target_size(
+                    res.target_mb, res.duration_sec)
+                comp_head = (f"🎯 цель ≤{res.target_mb} МБ → ~{bitrate}kbps "
+                             f"(до {tier_p}p, пропорции сохраняются)")
+            else:
+                tier_p, bitrate, q_label = config.QUALITY_PRESETS[quality]
+                comp_head = f"до {tier_p}p · {bitrate}kbps, пропорции сохраняются"
 
-        cz_dir = work / "cz"
-        compressed, res.seg_fallback = await compressor.compress_segments(
-            segs, cz_dir, tier_p, bitrate, ez_progress
-        )
-        if registry.cancelled:
-            raise asyncio.CancelledError()
+            res.seg_total = len(segs)
+            await _maybe(progress,
+                         f"📦 Сегментов: {len(segs)}. Сжимаю через ezgif "
+                         f"({comp_head})...")
 
-        # ---------- Concat ----------
-        await _maybe(progress, "🧩 Склеиваю сжатые части в один файл...")
-        merged = work / "merged.mp4"
-        await ffwrap.concat_copy(compressed, merged, registry=registry)
-        # После склейки таймстампы сегментов могут не сойтись → контейнер
-        # покажет либо «10 часов», либо «2 секунды». Второй проход нормализации
-        # чинит оба случая (см. _duration_is_sane).
-        merged = await ffwrap.normalize_recording(merged, registry=registry)
-        res.final_size = merged.stat().st_size
-        await _maybe(progress, f"✅ Готовый файл: {_human(res.final_size)}")
-        if registry.cancelled:
-            raise asyncio.CancelledError()
+            async def ez_progress(done: int, total: int):
+                storage.update(job_id, progress=f"ezgif {done}/{total}")
+                await _maybe(progress, f"🗜 ezgif: {done}/{total} сжато "
+                                       f"({comp_head})")
+
+            cz_dir = work / "cz"
+            compressed, res.seg_fallback = await compressor.compress_segments(
+                segs, cz_dir, tier_p, bitrate, ez_progress
+            )
+            if registry.cancelled:
+                raise asyncio.CancelledError()
+
+            # ---------- Concat ----------
+            await _maybe(progress, "🧩 Склеиваю сжатые части в один файл...")
+            merged = work / "merged.mp4"
+            await ffwrap.concat_copy(compressed, merged, registry=registry)
+            # После склейки таймстампы сегментов могут не сойтись → контейнер
+            # покажет либо «10 часов», либо «2 секунды». Второй проход нормализации
+            # чинит оба случая (см. _duration_is_sane).
+            merged = await ffwrap.normalize_recording(merged, registry=registry)
+            res.final_size = merged.stat().st_size
+            await _maybe(progress, f"✅ Готовый файл: {_human(res.final_size)}")
+            if registry.cancelled:
+                raise asyncio.CancelledError()
 
         # ---------- Upload ----------
         storage.update(job_id, status="uploading", progress="uploading")

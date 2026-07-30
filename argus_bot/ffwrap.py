@@ -71,16 +71,53 @@ def is_direct_stream(url: str) -> bool:
 
 
 async def _spawn_logged(cmd: List[str], log_path: Path,
-                        registry: "ProcRegistry | None") -> int:
+                        registry: "ProcRegistry | None",
+                        stall_watch: Path | None = None,
+                        stall_secs: int = 120) -> int:
+    """Spawn ffmpeg/yt-dlp, capture output to log_path.
+
+    If `stall_watch` is set, a watchdog checks its size every 10s and SIGTERM'ит
+    процесс, если файл не растёт `stall_secs` секунд подряд. Это спасает от
+    ffmpeg-reconnect'а, который висит бесконечно после смерти стрима.
+    """
     with open(log_path, "ab") as logf:
         logf.write(f"\n$ {' '.join(shlex.quote(c) for c in cmd)}\n".encode())
         logf.flush()
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=logf, stderr=logf)
         if registry is not None:
             registry.add(proc)
+
+        watchdog_task: asyncio.Task | None = None
+        if stall_watch is not None:
+            async def _watchdog():
+                last_size = -1
+                last_change = asyncio.get_event_loop().time()
+                while True:
+                    await asyncio.sleep(10)
+                    try:
+                        sz = stall_watch.stat().st_size if stall_watch.exists() else 0
+                    except OSError:
+                        sz = 0
+                    now = asyncio.get_event_loop().time()
+                    if sz != last_size:
+                        last_size = sz
+                        last_change = now
+                        continue
+                    if sz > 1024 and (now - last_change) >= stall_secs:
+                        log.warning("stall watchdog: %s не растёт %ds — SIGTERM ffmpeg (size=%d)",
+                                    stall_watch.name, stall_secs, sz)
+                        try:
+                            proc.send_signal(signal.SIGTERM)
+                        except (ProcessLookupError, Exception):
+                            pass
+                        return
+            watchdog_task = asyncio.create_task(_watchdog())
+
         try:
             rc = await proc.wait()
         finally:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
             if registry is not None:
                 registry.discard(proc)
     return rc
@@ -117,7 +154,8 @@ async def _ffmpeg_record(url: str, out_path: Path, log_path: Path,
         # ADTS AAC (HLS/TS) -> MP4 needs this bitstream filter
         cmd += ["-bsf:a", "aac_adtstoasc"]
     cmd += [str(out_path)]
-    return await _spawn_logged(cmd, log_path, registry)
+    return await _spawn_logged(cmd, log_path, registry,
+                               stall_watch=out_path, stall_secs=120)
 
 
 async def _ytdlp_record(url: str, out_path: Path, log_path: Path,
@@ -129,7 +167,8 @@ async def _ytdlp_record(url: str, out_path: Path, log_path: Path,
         "-o", str(out_path),
         url,
     ]
-    return await _spawn_logged(cmd, log_path, registry)
+    return await _spawn_logged(cmd, log_path, registry,
+                               stall_watch=out_path, stall_secs=180)
 
 
 async def record_stream(url: str, out_path: Path, log_path: Path,
