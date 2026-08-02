@@ -224,19 +224,52 @@ async def compress_one(session: aiohttp.ClientSession, src: Path,
     Разрешение подбирается ПОД ИСХОДНИК (сохраняя пропорции), а не жёстко.
     На неудаче кидает RuntimeError — caller (compress_segments) сделает
     fallback на оригинал.
+
+    ВАЖНО: перед отправкой в ezgif сегмент локально СКЕЙЛИТСЯ+ПАДДИТСЯ до
+    ТОЧНО той resolution, которую мы отдадим ezgif'у. Это делает шаг
+    «ezgif жёстко растягивает под выбранное WxH» no-op'ом — исходник уже
+    в правильных пикселях, растягивать нечего. Пропорции 100% сохраняются
+    (пустое место заполняется чёрными полосами).
     """
     w, h = await ffwrap.probe_dimensions(src)
     resolution = pick_resolution(w, h, tier_p)
     log.info("ezgif: %s (%dx%d) -> resolution=%s @ %skbps",
              src.name, w, h, resolution, bitrate)
 
-    file_field, original_id, result_url = await _upload(session, src)
-    save_name = await _recompress(
-        session,
-        file_field=file_field, original_id=original_id,
-        result_url=result_url, resolution=resolution, bitrate=bitrate,
+    # Локальный letterbox под целевой WxH — чтобы ezgif не мог растянуть.
+    tw, th = (int(x) for x in resolution.split("x"))
+    prescaled = src.with_name(src.stem + "_pre.mp4")
+    scale_pad = (
+        f"scale={tw}:{th}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"setsar=1"
     )
-    await _download_save(session, save_name, dst, result_url)
+    rc, _, err = await ffwrap._run([
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(src),
+        "-vf", scale_pad,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(prescaled),
+    ])
+    if rc != 0 or not prescaled.exists() or prescaled.stat().st_size == 0:
+        log.warning("prescale failed for %s: %s — отправляю оригинал",
+                    src.name, err.decode(errors='ignore')[:200])
+        prescaled = src
+
+    try:
+        file_field, original_id, result_url = await _upload(session, prescaled)
+        save_name = await _recompress(
+            session,
+            file_field=file_field, original_id=original_id,
+            result_url=result_url, resolution=resolution, bitrate=bitrate,
+        )
+        await _download_save(session, save_name, dst, result_url)
+    finally:
+        if prescaled != src:
+            prescaled.unlink(missing_ok=True)
+
     if not dst.exists() or dst.stat().st_size == 0:
         raise RuntimeError("downloaded compressed file is empty")
     return dst
